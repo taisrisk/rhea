@@ -2949,11 +2949,30 @@ fn resolve_binary() -> Result<PathBuf, String> {
     Err("agent-desktop was not found. Install it with `npm install -g agent-desktop` (or `brew install agent-desktop` on macOS), or set JARVUS_AGENT_DESKTOP_BIN to its native executable.".to_owned())
 }
 
+/// Where a CLI can live on macOS/Linux even though a GUI app inherits only a bare PATH:
+/// next to the app (a bundled copy), then Homebrew, npm, cargo and the system.
 #[cfg(not(windows))]
 fn find_on_path(name: &str) -> Option<PathBuf> {
-    env::split_paths(&env::var_os("PATH")?)
-        .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
+    let mut directories: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            directories.push(dir.to_path_buf());
+            // JARVUS.app/Contents/MacOS/jarvus -> JARVUS.app/Contents/Resources
+            directories.push(dir.join("../Resources"));
+        }
+    }
+    if let Some(path) = env::var_os("PATH") {
+        directories.extend(env::split_paths(&path));
+    }
+    for fixed in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+        directories.push(PathBuf::from(fixed));
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        for relative in [".npm-global/bin", ".local/bin", ".cargo/bin", ".volta/bin", "n/bin"] {
+            directories.push(home.join(relative));
+        }
+    }
+    directories.into_iter().map(|directory| directory.join(name)).find(|candidate| candidate.is_file())
 }
 
 /// Open Agent Desktop's own macOS permission guide. This is the supported

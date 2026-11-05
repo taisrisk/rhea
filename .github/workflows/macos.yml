@@ -1,5 +1,9 @@
 name: macOS build
 
+# Builds, tests and packages JARVUS for macOS (Apple Silicon and Intel). The Windows build is made
+# on a PC and uploaded to the release by hand (scripts/release.ps1 -Upload); publishing a release
+# makes this workflow attach the macOS .dmg and .zip files to it automatically.
+
 on:
   push:
     branches: [main, master]
@@ -7,46 +11,56 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach the macOS builds to (leave empty to only build)"
+        required: false
+        type: string
   release:
     types: [published]
 
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  AGENT_DESKTOP_VERSION: "1.2.0"
+
 jobs:
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: macOS x64
-            runner: macos-15-intel
-            rust_target: x86_64-apple-darwin
-            asset_arch: x64
           - name: macOS Apple Silicon
             runner: macos-15
             rust_target: aarch64-apple-darwin
             asset_arch: arm64
+          - name: macOS Intel
+            runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            asset_arch: x64
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_target }}
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
         with:
-          node-version: 22
+          key: ${{ matrix.rust_target }}
 
-      - name: Install Agent Desktop
+      - name: Install Agent Desktop (used by the tests and bundled in the app)
         run: |
-          npm install --global agent-desktop
+          npm install --global "agent-desktop@${AGENT_DESKTOP_VERSION}"
           agent-desktop version
 
       - name: Test
@@ -55,45 +69,48 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin jarvus --target ${{ matrix.rust_target }}
 
-      - name: Package executable
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' Cargo.toml | head -n 1)"
-          test -n "$version"
-          stage="dist/JARVUS-v${version}-macos-${{ matrix.asset_arch }}"
-          mkdir -p "$stage"
-          cp "target/${{ matrix.rust_target }}/release/jarvus" "$stage/jarvus"
-          cp README.md "$stage/README.md"
-          cp assets/jarvus-mark.png "$stage/jarvus-mark.png"
-          chmod +x "$stage/jarvus"
-          tar -C dist -czf "dist/JARVUS-v${version}-macos-${{ matrix.asset_arch }}.tar.gz" "JARVUS-v${version}-macos-${{ matrix.asset_arch }}"
+      - name: Package .app, .zip and .dmg
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: bash packaging/macos/package.sh "${{ matrix.rust_target }}" "${{ matrix.asset_arch }}"
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
         with:
           name: jarvus-macos-${{ matrix.asset_arch }}
-          path: dist/*.tar.gz
+          path: |
+            dist/JARVUS-v*-macos-*.dmg
+            dist/JARVUS-v*-macos-*.zip
           if-no-files-found: error
           retention-days: 14
 
   attach-release-assets:
-    name: Attach macOS builds to the published release
-    if: github.event_name == 'release' && github.event.action == 'published'
+    name: Attach macOS builds to the release
     needs: build
+    if: >-
+      (github.event_name == 'release' && github.event.action == 'published') ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Download macOS artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: jarvus-macos-*
           path: dist
           merge-multiple: true
 
-      - name: Upload assets to this release
+      - name: Upload assets to the release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" dist/*.tar.gz --clobber
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          ls -l dist
+          gh release upload "$RELEASE_TAG" dist/*.dmg dist/*.zip --clobber

@@ -5,10 +5,17 @@ mod auth;
 mod browser;
 mod chat;
 mod chat_store;
+mod compose;
 mod desktop;
+mod hooks;
 mod jev;
+#[cfg(target_os = "macos")]
+mod macos;
 mod mcp;
 mod shell;
+mod skills;
+mod team;
+mod tools;
 mod uia;
 
 use std::sync::Arc;
@@ -157,7 +164,7 @@ fn run_gui() -> eframe::Result {
                     // Only chat bubbles, tool results and similar content opt in to text
                     // selection; chrome labels (titles, buttons, captions) stay unselectable.
                     style.interaction.selectable_labels = false;
-                    style.animation_time = 0.18;
+                    style.animation_time = 0.15;
                 });
             Ok(Box::new(app::JarvusApp::default()))
         }),

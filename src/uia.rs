@@ -702,6 +702,7 @@ pub use imp::{
 };
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 mod macos {
     use super::{Button, FocusedControl};
     use serde_json::Value;
@@ -758,50 +759,21 @@ mod macos {
     }
 
     pub fn foreground_title() -> String {
-        focused_window()
-            .and_then(|window| {
-                window
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .unwrap_or_default()
+        crate::macos::front_window_title()
     }
 
     pub fn app_is_foreground(app: &str) -> bool {
-        focused_window().is_some_and(|window| {
-            ["app_name", "title"].iter().any(|key| {
-                window
-                    .get(*key)
-                    .and_then(Value::as_str)
-                    .is_some_and(|found| crate::desktop::label_score(app, found, false) > 0)
-            })
-        })
+        let front = crate::macos::front_app_name();
+        crate::desktop::label_score(app, &front, false) > 0
+            || crate::desktop::label_score(app, &crate::macos::front_window_title(), false) > 0
     }
 
     pub fn app_has_window(app: &str) -> bool {
-        windows(Some(app)).is_some_and(|items| !items.is_empty())
+        crate::macos::app_has_window(app)
     }
 
     pub fn focus_app_window(app: &str) -> Result<String, String> {
-        if app.trim().is_empty() {
-            return Err("No app name.".into());
-        }
-        let result = crate::desktop::focus_window(None, Some(app), None)?;
-        if result.get("ok").and_then(Value::as_bool) != Some(true) {
-            return Err(result
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("Agent Desktop could not focus the requested app.")
-                .to_owned());
-        }
-        // focus-window returns the focused window in its documented envelope.
-        Ok(result
-            .pointer("/data/focused/title")
-            .and_then(Value::as_str)
-            .filter(|title| !title.is_empty())
-            .unwrap_or(app)
-            .to_owned())
+        crate::macos::activate(app)
     }
 
     pub fn window_tree(app: &str) -> Result<Value, String> {
@@ -818,113 +790,31 @@ mod macos {
     }
 
     pub fn cursor() -> (i32, i32) {
-        (0, 0)
+        crate::macos::cursor()
     }
 
     pub fn move_smooth(x: i32, y: i32) -> Result<(), String> {
-        let snapshot = crate::desktop::snapshot_target("focused", None, None, false, false)?.json;
-        let result =
-            crate::desktop::mouse_move_from_snapshot(snapshot_id(&snapshot)?, x as i64, y as i64)?;
-        if action_succeeded(&result) {
-            Ok(())
-        } else {
-            Err(action_error(
-                &result,
-                "Agent Desktop could not move the pointer.",
-            ))
-        }
+        crate::macos::move_smooth(x, y)
     }
 
     pub fn click(x: i32, y: i32, button: Button, count: u32, restore: bool) -> Result<(), String> {
-        if restore {
-            return Err("Agent Desktop cannot restore the pointer position after a click.".into());
-        }
-        // Require a fresh observation before coordinate-based input, so stale
-        // screen coordinates are never blindly replayed.
-        let _snapshot = crate::desktop::snapshot_target("focused", None, None, false, false)?;
-        let button = match button {
-            Button::Left => "left",
-            Button::Right => "right",
-            Button::Middle => "middle",
-        };
-        let result = crate::desktop::mouse_click_at(x as i64, y as i64, button, count.clamp(1, 3))?;
-        if result.get("ok").and_then(Value::as_bool) == Some(true) {
-            Ok(())
-        } else {
-            Err(result
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("Agent Desktop could not click the requested position.")
-                .to_owned())
-        }
+        crate::macos::click(x, y, button, count, restore)
     }
 
-    pub fn button(_button: Button, _down: bool) -> Result<(), String> {
-        Err("Agent Desktop does not expose standalone mouse-down/up actions on macOS.".into())
+    pub fn button(button: Button, down: bool) -> Result<(), String> {
+        crate::macos::button(button, down)
     }
 
-    pub fn drag(from: (i32, i32), to: (i32, i32), _button: Button) -> Result<(), String> {
-        let _snapshot = crate::desktop::snapshot_target("focused", None, None, false, false)?;
-        let result =
-            crate::desktop::drag_at((from.0 as i64, from.1 as i64), (to.0 as i64, to.1 as i64))?;
-        if result.get("ok").and_then(Value::as_bool) == Some(true) {
-            Ok(())
-        } else {
-            Err(result
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("Agent Desktop could not drag the requested position.")
-                .to_owned())
-        }
+    pub fn drag(from: (i32, i32), to: (i32, i32), button: Button) -> Result<(), String> {
+        crate::macos::drag(from, to, button)
     }
 
     pub fn wheel(x: i32, y: i32, notches: i32) -> Result<(), String> {
-        if (x, y) == (0, 0) {
-            return Err(
-                "A pointer position is required for Agent Desktop mouse-wheel input.".into(),
-            );
-        }
-        let _snapshot = crate::desktop::snapshot_target("focused", None, None, false, false)?;
-        let result = crate::desktop::mouse_wheel_at(x as i64, y as i64, notches)?;
-        if result.get("ok").and_then(Value::as_bool) == Some(true) {
-            Ok(())
-        } else {
-            Err(result
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("Agent Desktop could not scroll the requested position.")
-                .to_owned())
-        }
+        crate::macos::wheel(x, y, notches)
     }
 
     pub fn press_combo(combo: &str) -> Result<(), String> {
-        let combo = combo
-            .split('+')
-            .map(str::trim)
-            .map(|part| {
-                if part.eq_ignore_ascii_case("ctrl")
-                    || part.eq_ignore_ascii_case("control")
-                    || part.eq_ignore_ascii_case("win")
-                    || part.eq_ignore_ascii_case("meta")
-                    || part.eq_ignore_ascii_case("super")
-                {
-                    "cmd"
-                } else {
-                    part
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("+");
-        let snapshot = crate::desktop::snapshot_target("focused", None, None, false, false)?.json;
-        let result = crate::desktop::press_from_snapshot(snapshot_id(&snapshot)?, &combo)?;
-        if action_succeeded(&result) {
-            Ok(())
-        } else {
-            Err(action_error(
-                &result,
-                "Agent Desktop could not deliver the key combination.",
-            ))
-        }
+        crate::macos::press_combo(combo)
     }
 }
 #[cfg(target_os = "macos")]
@@ -984,7 +874,7 @@ mod fallback {
         Err(NO.into())
     }
 }
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub use fallback::*;
 
 /// Kept for callers that only need a quick read of a value.

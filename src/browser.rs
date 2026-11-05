@@ -755,13 +755,16 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), Browse
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     use std::io::Write;
     let mut file = options.open(path)?;
     #[cfg(unix)]
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())

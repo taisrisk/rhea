@@ -23,6 +23,35 @@ Chat with tool history on the left, conversation history on the right, model pic
 
 Desktop automation is permissioned by the operating system. On macOS, JARVUS requires Agent Desktop's Accessibility permission; screenshot capture also requires Screen Recording permission. Review the permission prompt before enabling it.
 
+## Core skills, Shell and sessions
+
+JEV always follows two built-in skills adapted from [obra/superpowers](https://github.com/obra/superpowers) (MIT): **systematic debugging** (root cause before any fix) and **brainstorming** (understand what the user wants before building). The Shell package's `run_command` runs anything a terminal can (PowerShell, cmd, bash, zsh; up to 15 minutes; `detach` for servers and installers), and a `jev_run_plan` can mix `shell` steps with GUI steps so "install it, open it, click through it" is a single plan. Every chat has a stable session id that keys the ChatGPT prompt cache (the Codex backend does not store conversations server-side, so the full local history is always sent), and the first message also starts a background naming agent that renames the chat with the selected model at its lowest reasoning effort.
+
+## Compose mode, subagents and hooks
+
+**Compose mode** (the toggle next to the context ring) makes JEV investigate first: it can read files, search, run read-only commands and browse, but nothing that changes your machine. It asks questions with `ask_user` (a panel that grows out of the chat box), then proposes a plan you **Accept** or **Revise**. Accepting unlocks every tool and JEV carries the plan out. Bug reports get a debugging section: reproduction, hypotheses, root cause, fix and tests.
+
+![Compose mode plan panel](docs/compose.png)
+
+**Subagents** let the main model act as a manager. `agent_spawn` starts a worker with its own context and model (default: the main model, changeable in Settings); workers use the same tools, message the manager and each other with `agent_send`, and every agent sees a live team status. A finished worker keeps its context and can be given a new task. Each worker gets a generated pixel avatar (a mirrored 5x5 pattern in two complementary colors). The right panel gains a **History | Subagents** switcher; click a worker to read its work and message it.
+
+![Subagent panel](docs/subagents.png)
+
+**Hooks** run your scripts around the agent, in the style of Claude Code and Codex hooks. Configure them in Settings -> Agents & hooks or in `~/.jarvus/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "mcp__jarvus_shell__*",
+        "hooks": [{ "type": "command", "command": "python check.py", "timeout": 10 }] }
+    ]
+  }
+}
+```
+
+Events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStart`, `SubagentStop`. A hook gets the event as JSON on stdin; exit code 2 blocks (stderr is the reason shown to the model), and JSON on stdout can add `additionalContext`, replace tool input with `updatedInput`, or stop the turn. A hook that fails or times out never blocks the agent.
+
 ## Requirements
 
 ### Windows development
@@ -143,3 +172,11 @@ The upload option requires GitHub CLI authentication, a configured `origin`, a m
 - macOS releases need an interactive Mac verification pass for permissions, app launch, browser connection, and desktop actions.
 - Agent Desktop can only act on controls its accessibility provider exposes. When a target is missing or ambiguous, JEV should stop and report the limitation instead of guessing.
 - A successful build does not prove that a ChatGPT account, MCP server, browser extension, or third-party desktop action works end to end.
+
+## Skills, slash commands and context
+
+**Skills** are folders with a `SKILL.md`. JARVUS lists the ones in `~/.jarvus/skills`, `~/.agents/skills` and `~/.claude/skills` to the model on every run; the model loads one with `use_skill` when a request matches, and `install_skill` (or Settings → Agents, skills & hooks) installs one from a GitHub link. Type `/` in the chat box for the command menu: `/compact`, `/compose`, `/new`, every installed skill (`/skill-name` loads it for that message) and every MCP server. Hover an entry to see what it does.
+
+**Context.** Each chat keeps its own gauge, latest request usage, cache totals and cumulative totals, and they survive new messages and restarts. A request that would fill more than the **auto-compact** share of the window (Settings → Chat & model, 15–95%, default 80%) summarizes older turns first; `/compact` does it on demand and the transcript shows where. Inside a subagent's chat the context panel shows that agent's own context.
+
+**Team work.** The manager keeps working while its subagents run, receives each worker's full report as a message, and a turn does not end while workers are still running.

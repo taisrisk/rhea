@@ -9,7 +9,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Every cancel bumps this counter; a worker thread compares it with the value it
 /// saw when its run began, so cancelling one run can never affect the next.
 static CANCEL_GENERATION: AtomicU64 = AtomicU64::new(0);
-thread_local! { static RUN_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+thread_local! {
+    static RUN_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STOP_FLAG: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Give this worker thread its own stop switch (used for individual subagents) in
+/// addition to the global cancel that stops everything.
+pub fn set_run_stop_flag(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    STOP_FLAG.with(|slot| *slot.borrow_mut() = Some(flag));
+}
 
 /// Call on the worker thread when a chat run starts.
 pub fn begin_run() {
@@ -21,6 +30,7 @@ pub fn request_cancel() {
 }
 pub fn cancel_requested() -> bool {
     RUN_GENERATION.with(|run| run.get()) != CANCEL_GENERATION.load(Ordering::SeqCst)
+        || STOP_FLAG.with(|slot| slot.borrow().as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)))
 }
 
 pub fn execute(name: &str, arguments: &Value) -> Result<Value, String> {
@@ -226,9 +236,14 @@ pub(crate) fn type_text(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub(crate) fn type_text(text: &str) -> Result<(), String> {
+    crate::macos::type_text(text)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn type_text(_text: &str) -> Result<(), String> {
-    Err("JEV keyboard typing is available only on Windows.".into())
+    Err("JEV keyboard typing is available on Windows and macOS only.".into())
 }
 
 /// Press a key combination ("ENTER", "ctrl+k", "ctrl+shift+tab", "f5").
@@ -236,6 +251,34 @@ pub(crate) fn press_key(key: &str) -> Result<(), String> {
     crate::uia::press_combo(key)
 }
 
+#[cfg(not(windows))]
+fn list_processes() -> Result<Value, String> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,rss=,comm="])
+        .output()
+        .map_err(|e| format!("Could not list processes: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("ps failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    let processes: Vec<Value> = String::from_utf8_lossy(&output.stdout).lines().filter_map(parse_ps_row).take(300).collect();
+    Ok(json!({ "count": processes.len(), "processes": processes }))
+}
+
+/// One `ps -axo pid=,rss=,comm=` line: "  123 45678 /Applications/Foo.app/Contents/MacOS/Foo".
+#[cfg(not(windows))]
+fn parse_ps_row(line: &str) -> Option<Value> {
+    let mut parts = line.split_whitespace();
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let rss_kb = parts.next()?.parse::<u64>().ok()?;
+    let path = parts.collect::<Vec<_>>().join(" ");
+    if path.is_empty() {
+        return None;
+    }
+    let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+    Some(json!({"image_name": name, "pid": pid, "memory": format!("{rss_kb} K"), "path": path}))
+}
+
+#[cfg(windows)]
 fn list_processes() -> Result<Value, String> {
     let mut command = Command::new("tasklist.exe");
     command.args(["/FO", "CSV", "/NH"]);
@@ -312,7 +355,16 @@ pub fn open_app(requested: &str) -> Result<Value, String> {
                     shell_open(&shortcut.to_string_lossy())?;
                     json!({"shortcut":shortcut,"launch_method":"Start menu shortcut"})
                 }
-                #[cfg(not(windows))]
+                #[cfg(target_os = "macos")]
+                {
+                    // Agent Desktop does not know the app; let macOS look it up by name.
+                    let opened = Command::new("open").arg("-a").arg(app).status();
+                    if !opened.is_ok_and(|status| status.success()) {
+                        return Err(format!("macOS could not find an app called '{app}'."));
+                    }
+                    json!({"launch_method": "open -a"})
+                }
+                #[cfg(not(any(windows, target_os = "macos")))]
                 {
                     return Err(format!(
                         "Agent Desktop could not find or launch '{app}': {}",
@@ -398,6 +450,32 @@ pub fn run_plan(arguments: &Value) -> Result<Value, String> {
                 Ok((found.x, found.y))
             };
             match action {
+                // A command-line step inside a plan: Shell and the GUI share one plan, so
+                // "install it, open it, click through it" costs a single model round trip.
+                "shell" => {
+                    let command = field("text").ok_or("shell needs text = the command to run")?;
+                    let directory = field("target")
+                        .map(PathBuf::from)
+                        .or_else(|| env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")).map(PathBuf::from))
+                        .ok_or("shell needs a working directory in target")?;
+                    let detach = field("keys") == Some("detach");
+                    let timeout = int("ms").filter(|ms| *ms > 0).unwrap_or(120_000);
+                    let result = crate::shell::execute(
+                        "mcp__jarvus_shell__run_command",
+                        &json!({"command": command, "working_directory": directory.to_string_lossy(),
+                                "timeout_ms": timeout, "shell": null, "detach": detach}),
+                    )?;
+                    let clip = |value: &Value| value.as_str().unwrap_or("").chars().take(1500).collect::<String>();
+                    step_detail = Some(json!({
+                        "exit_code": result["exit_code"], "duration_ms": result["duration_ms"], "pid": result["pid"],
+                        "stdout": clip(&result["stdout"]), "stderr": clip(&result["stderr"]),
+                    }));
+                    if result["success"].as_bool().unwrap_or(false) {
+                        Ok(())
+                    } else {
+                        Err(format!("command failed (exit {}): {}", result["exit_code"], clip(&result["stderr"])))
+                    }
+                }
                 "open_app" => ensure_app_focused(&current_app()?),
                 "click" | "double_click" | "right_click" => {
                     bring_forward(&current_app()?)?;
@@ -1161,7 +1239,16 @@ fn shell_open(target: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn shell_open(target: &str) -> Result<(), String> {
+    Command::new("open")
+        .arg(target)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open {target}: {e}"))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn shell_open(target: &str) -> Result<(), String> {
     Command::new(target)
         .spawn()

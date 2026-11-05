@@ -2,7 +2,7 @@
   {
     "type": "function",
     "name": "list_processes",
-    "description": "List running Windows processes. Use for process inventory, not as proof that an app has a usable UI window.",
+    "description": "List running processes. Use for process inventory, not as proof that an app has a usable UI window.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -14,7 +14,7 @@
   {
     "type": "function",
     "name": "jev_run_plan",
-    "description": "Use for local desktop action sequences. JEV runs the bounded steps and returns their results; ChatGPT must inspect those results and continue when the user goal spans multiple actions. A research, search, count, threshold, comparison, or summary task must return to ChatGPT for verification and next steps. Multi-step plans always return to ChatGPT, even if final=true is requested; the app enforces this. Only a single mechanical action with an observable successful result may finish locally. Never treat a plan's completed status alone as proof of a research goal. For web research, use browser search/extract tools, gather the requested number/threshold of sourced results, then summarize only what was observed. Targets are visible labels; JEV resolves them from fresh app state. If a step fails, nothing later runs; use the returned state to continue without repeating completed work. Never resend after message_sent is true.",
+    "description": "Use for local desktop action sequences. JEV runs the bounded steps and returns their results; ChatGPT must inspect those results and continue when the user goal spans multiple actions. A research, search, count, threshold, comparison, or summary task must return to ChatGPT for verification and next steps. Multi-step plans always return to ChatGPT, even if final=true is requested; the app enforces this. Only a single mechanical action with an observable successful result may finish locally. Never treat a plan's completed status alone as proof of a research goal. For web research, use browser search/extract tools, gather the requested number/threshold of sourced results, then summarize only what was observed. Targets are visible labels; JEV resolves them from fresh app state. If a step fails, nothing later runs; use the returned state to continue without repeating completed work. Never resend after message_sent is true. Shell step: shell{text: the command, target: working directory (null = home), keys: 'detach' to run it in the background (servers, installer windows, launching a program), ms: timeout in ms (default 120000, max 900000)}; a nonzero exit stops the plan and returns stdout/stderr so you can re-plan. Mix freely with GUI steps, e.g. shell winget install -> open_app -> click 'Next' (within dialog) -> wait 'Finish', all in one plan.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -30,6 +30,7 @@
                 "type": "string",
                 "enum": [
                   "open_app",
+                  "shell",
                   "message",
                   "click",
                   "double_click",
@@ -485,7 +486,7 @@
   {
     "type": "function",
     "name": "desktop_click",
-    "description": "Activate one uniquely identified control from the latest JEV snapshot using Windows UI Automation semantics so the intended control can receive focus without forcing a physical pointer click. JEV checks delivery and returns a fresh compact snapshot of the same app/window. Complete navigation to the intended destination before the send sequence; after desktop_send is called, do not click as a fallback. Use desktop_mouse_click only when a physical coordinate click is specifically needed.",
+    "description": "Activate one uniquely identified control from the latest JEV snapshot using native accessibility semantics (UI Automation on Windows, the Accessibility API on macOS) so the intended control can receive focus without forcing a physical pointer click. JEV checks delivery and returns a fresh compact snapshot of the same app/window. Complete navigation to the intended destination before the send sequence; after desktop_send is called, do not click as a fallback. Use desktop_mouse_click only when a physical coordinate click is specifically needed.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -802,6 +803,275 @@
       },
       "required": [
         "server"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "ask_user",
+    "description": "Ask the user one or more questions and wait for their answers (shown above the chat box). Use sparingly for decisions that change the outcome and cannot be found by looking. Give 2-4 mutually exclusive options, recommended first; the user may also type their own answer when allow_custom is true. Returns {answers:[{id,answer}]} or {skipped:true}.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "questions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Short snake_case id"
+              },
+              "question": {
+                "type": "string"
+              },
+              "options": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "label": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Optional one-line detail"
+                    }
+                  },
+                  "required": [
+                    "label",
+                    "description"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "allow_custom": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "id",
+              "question",
+              "options",
+              "allow_custom"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "questions"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "propose_plan",
+    "description": "Compose mode only. Present the finished, decision-complete plan (Markdown) to the user. They either Accept (full tools unlock and you carry the plan out) or Revise (you get their feedback and must call propose_plan again with a complete replacement plan). Call it once per turn; never end by asking whether to proceed.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "plan_markdown": {
+          "type": "string",
+          "maxLength": 60000
+        }
+      },
+      "required": [
+        "plan_markdown"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "agent_spawn",
+    "description": "Start a worker agent (subagent) with its own context and the same tools as you (no ask_user, no spawning). The worker knows ONLY what is in `task`, so write a complete brief with these labelled sections: GOAL (the outcome, one or two sentences), CONTEXT (what you already know: paths, findings, decisions, the user's constraints), SCOPE (files or areas it owns and may edit; what it must not touch), STEPS (a numbered plan or the investigation order), CHECKS (exact commands or observations that prove it is done: tests to run, output to compare), DELIVERABLE (exactly what the final report must contain: file paths, full lists/tables, command output), and LIMITS (no commits, no installs, etc.). It runs in the background; its full report comes back to you as a message. Workers can message you and each other.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Short unique name, e.g. perf, tests, research"
+        },
+        "task": {
+          "type": "string",
+          "maxLength": 30000,
+          "description": "The complete brief: GOAL / CONTEXT / SCOPE / STEPS / CHECKS / DELIVERABLE / LIMITS. Concrete paths and exact commands, not a vague one-liner."
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Model slug; null = same model as you (or the model chosen in Settings)"
+        }
+      },
+      "required": [
+        "name",
+        "task",
+        "model"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "agent_send",
+    "description": "Send a message to a worker (by name or id) or to the manager ('main'). A finished worker keeps its context and is resumed with your message as its next task.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "to": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 30000
+        }
+      },
+      "required": [
+        "to",
+        "message"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "agent_list",
+    "description": "List every agent in this chat with status (running/done/failed/stopped) and its last checkpoint.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "agent_read",
+    "description": "Read an agent's latest output: result, checkpoint and the tail of its transcript.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Agent name or id"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "agent_wait",
+    "description": "Wait until the named agents (or all running agents when ids is null) finish, a message for you arrives, or timeout_ms passes (default 120000, max 600000). Returns their statuses, results and any messages.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "ids": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "timeout_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Milliseconds"
+        }
+      },
+      "required": [
+        "ids",
+        "timeout_ms"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "agent_stop",
+    "description": "Stop a running agent that is no longer needed.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Agent name or id"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "use_skill",
+    "description": "Load an installed skill's full instructions (see the Installed skills list). Call it before starting a task a skill covers, then follow it. Returns the instructions, the skill's folder and its extra files.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Skill name from the Installed skills list"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "install_skill",
+    "description": "Install a skill from GitHub into ~/.jarvus/skills when the user asks for it. source = a link to the skill folder or its SKILL.md (https://github.com/owner/repo/tree/main/skills/name), or a repo link (then it lists the skills inside). Returns the installed name.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "GitHub link to the skill folder, SKILL.md, or repo"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional folder name; default is the skill's own name"
+        }
+      },
+      "required": [
+        "source",
+        "name"
       ],
       "additionalProperties": false
     }

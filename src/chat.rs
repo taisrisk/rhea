@@ -132,8 +132,39 @@ pub fn title_model(models: &[Model]) -> Option<TitleModel> {
     })
 }
 
-const TITLE_PROMPT: &str =
-    "Create a short title for this request (2-6 words). Return only the title.";
+/// Instructions for the background naming agent. The shipped prompt ends with a
+/// `<session>` template block; the app supplies the real session content itself.
+fn title_instructions() -> String {
+    let raw = include_str!("session_title_prompt.md");
+    let closing = "`</session>`";
+    match (raw.rfind("`<session>`"), raw.rfind(closing)) {
+        (Some(start), Some(end)) if end > start => format!("{}{}", &raw[..start], &raw[end + closing.len()..]),
+        _ => raw.to_owned(),
+    }
+    .trim()
+    .to_owned()
+}
+
+/// The user's own selected model, at the lowest reasoning effort it advertises.
+pub fn title_model_for(models: &[Model], selected_slug: &str) -> Option<TitleModel> {
+    let model = models.iter().find(|model| model.slug == selected_slug).or_else(|| models.first())?;
+    let rank = |effort: &str| match effort.to_ascii_lowercase().as_str() {
+        "none" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" => 5,
+        _ => 99,
+    };
+    let effort = model
+        .supported_reasoning_levels
+        .iter()
+        .min_by_key(|effort| rank(effort))
+        .cloned()
+        .unwrap_or_else(|| "low".to_owned());
+    Some(TitleModel { slug: model.slug.clone(), reasoning_effort: effort })
+}
 const TITLE_SOURCE_CHAR_LIMIT: usize = 1_000;
 const TITLE_CHAR_LIMIT: usize = 64;
 
@@ -305,7 +336,10 @@ fn title_request_body(model: &TitleModel, request_excerpt: &str) -> Value {
     json!({
         "model":model.slug,
         "reasoning":{"effort":model.reasoning_effort},
-        "input":[{"role":"user","content":format!("{TITLE_PROMPT}\n\n{request_excerpt}")}],
+        "input":[
+            {"role":"developer","content":title_instructions()},
+            {"role":"user","content":format!("<session>\n{request_excerpt}\n</session>")}
+        ],
         "tools":[],"tool_choice":"none","parallel_tool_calls":false,
         "store":false,"stream":true
     })
@@ -334,7 +368,7 @@ pub struct ToolActivity {
     pub result_detail: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub cached_tokens: u64,
@@ -342,6 +376,29 @@ pub struct Usage {
     pub output_tokens: u64,
     pub cache_reported: bool,
     pub cache_write_reported: bool,
+}
+
+/// Add or update a tool call in a turn's list. Nothing is dropped as the list grows; only the
+/// bulky argument/result text of calls far behind the newest is cleared so saved chats stay small.
+pub fn record_activity(list: &mut Vec<ToolActivity>, activity: ToolActivity) {
+    const KEEP_DETAIL: usize = 60;
+    const MAX_CALLS: usize = 2_000;
+    if let Some(existing) = list.iter_mut().rev().find(|item| item.id == activity.id) {
+        *existing = activity;
+        return;
+    }
+    list.push(activity);
+    let len = list.len();
+    if len > KEEP_DETAIL {
+        let old = &mut list[len - KEEP_DETAIL - 1];
+        if old.state != "running" {
+            old.arguments_detail.clear();
+            old.result_detail.clear();
+        }
+    }
+    if len > MAX_CALLS {
+        list.remove(0);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -476,35 +533,114 @@ fn send_chat_request_with_cancel(
     })
 }
 
-pub const DEFAULT_CONTEXT_WINDOW: u64 = 264_000;
-const SYSTEM_PROMPT: &str = include_str!("system_prompt.md");
-
-pub fn respond(
-    access_token: &str,
-    account_id: Option<&str>,
-    model: &str,
-    context_window: u64,
-    prior_summary: &str,
-    history: &[Turn],
-    user_message: &str,
-    send: impl Fn(StreamEvent),
-) -> Result<String, String> {
-    respond_with_tools(
-        access_token,
-        account_id,
-        model,
-        "medium",
-        context_window,
-        prior_summary,
-        history,
-        user_message,
-        &[],
-        crate::jev::execute,
-        send,
-    )
+/// A Stop hook may send the model back to work, at most twice per turn.
+fn stop_hook_reason(options: &RunOptions, answer: &str, retries: &mut u8) -> Option<String> {
+    if *retries >= 2 {
+        return None;
+    }
+    let reason = options.on_stop.as_ref().and_then(|stop| stop(answer))?;
+    *retries += 1;
+    Some(reason)
 }
 
-pub fn respond_with_tools(
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 264_000;
+/// The operating manual for this platform (Windows-first text, or the macOS edition).
+#[cfg(target_os = "macos")]
+const PLATFORM_PROMPT: &str = include_str!("system_prompt_macos.md");
+#[cfg(not(target_os = "macos"))]
+const PLATFORM_PROMPT: &str = include_str!("system_prompt.md");
+
+/// Operating instructions, always-on skills, and concrete end-to-end examples.
+fn system_prompt() -> &'static str {
+    static PROMPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PROMPT.get_or_init(|| {
+        [
+            PLATFORM_PROMPT,
+            include_str!("skills/systematic_debugging.md"),
+            include_str!("skills/brainstorming.md"),
+            include_str!("workflow_examples.md"),
+        ]
+        .join("
+
+")
+    })
+}
+
+const COMPOSE_PROMPT: &str = include_str!("compose_prompt.md");
+
+/// Per-run behaviour beyond the plain tool loop: Compose Mode, subagent plumbing and hooks.
+#[derive(Default)]
+pub struct RunOptions {
+    /// Start in Compose Mode: read-only tools until the user accepts a proposed plan.
+    pub compose: bool,
+    /// Extra developer messages appended after the user message (subagent prompt, hook context).
+    pub extra_developer: Vec<String>,
+    /// Tool names this run must not see or call (e.g. `ask_user` for subagents).
+    pub hidden_tools: Vec<String>,
+    /// Polled before every model request; returns messages from other agents / the team status.
+    pub inbox: Option<Box<dyn Fn() -> Vec<String> + Send>>,
+    /// Stable client-generated chat key for cache affinity; local history is still sent each turn.
+    pub session_id: Option<String>,
+    /// A subagent run: the "verify research evidence" completion gate is for the user's own
+    /// requests, not for a worker's task description.
+    pub worker: bool,
+    /// Called with the final answer; `Some(reason)` makes the model keep going (a Stop hook).
+    pub on_stop: Option<Box<dyn Fn(&str) -> Option<String> + Send>>,
+    /// Called when the model is ready to finish: blocks while workers are still running and
+    /// returns what they sent, so the manager never ends a turn with work in flight.
+    pub hold_for_team: Option<Box<dyn Fn() -> Vec<String> + Send>>,
+    /// Compact the transcript once a request would fill this share of the context window.
+    pub compact_percent: u8,
+}
+
+pub const DEFAULT_COMPACT_PERCENT: u8 = 80;
+pub const MIN_COMPACT_PERCENT: u8 = 15;
+pub const MAX_COMPACT_PERCENT: u8 = 95;
+
+pub fn clamp_compact_percent(percent: u8) -> u8 {
+    percent.clamp(MIN_COMPACT_PERCENT, MAX_COMPACT_PERCENT)
+}
+
+/// Replace the bulky results of old tool calls with a short stub. A long run keeps its recent
+/// work verbatim while the earliest outputs stop crowding the context window.
+fn trim_old_tool_outputs(input: &mut [Value], keep_recent: usize) -> usize {
+    let end = input.len().saturating_sub(keep_recent);
+    let mut trimmed = 0;
+    for item in input[..end].iter_mut() {
+        if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
+            continue;
+        }
+        let Some(output) = item.get("output").and_then(Value::as_str) else { continue };
+        if output.chars().count() <= 1_200 {
+            continue;
+        }
+        let head: String = output.chars().take(600).collect();
+        item["output"] = json!(format!("{head}
+…[older tool result trimmed to save context; re-run the tool if you need the rest]"));
+        trimmed += 1;
+    }
+    trimmed
+}
+
+/// Summarize a whole transcript on demand (the `/compact` command).
+pub fn compact_conversation(access_token: &str, account_id: Option<&str>, model: &str, prior_summary: &str, session_id: Option<&str>, turns: &[Turn]) -> Result<String, String> {
+    let http = Client::builder().timeout(Duration::from_secs(180)).build().map_err(|e| e.to_string())?;
+    compact_history(access_token, account_id, model, prior_summary, session_id, turns, &http, &|_| {})
+}
+
+fn request_tools(tools: &Value, compose_active: bool, hidden: &[String]) -> Value {
+    let list = tools.as_array().cloned().unwrap_or_default();
+    let mut list: Vec<Value> = if compose_active {
+        crate::compose::filter_tools(&list)
+    } else {
+        list.into_iter().filter(|tool| tool.get("name").and_then(Value::as_str) != Some("propose_plan")).collect()
+    };
+    list.retain(|tool| tool.get("name").and_then(Value::as_str).is_none_or(|name| !hidden.iter().any(|h| h == name)));
+    Value::Array(list)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn respond_with_options(
     access_token: &str,
     account_id: Option<&str>,
     model: &str,
@@ -515,6 +651,7 @@ pub fn respond_with_tools(
     user_message: &str,
     extra_tools: &[Value],
     mut execute_tool: impl FnMut(&str, &Value) -> Result<Value, String>,
+    options: RunOptions,
     send: impl Fn(StreamEvent),
 ) -> Result<String, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -541,11 +678,13 @@ pub fn respond_with_tools(
     let mut request_history = history.to_vec();
     let mut current_summary = prior_summary.trim().to_owned();
     let window = context_window.max(16_000);
-    let estimated = estimate_tokens(SYSTEM_PROMPT)
+    let estimated = estimate_tokens(system_prompt())
         + estimate_turns(&request_history)
         + estimate_tokens(user_message)
         + estimate_tokens(&current_summary);
-    if estimated > window.saturating_mul(3) / 4 && request_history.len() > 16 {
+    let compact_percent = u64::from(clamp_compact_percent(if options.compact_percent == 0 { DEFAULT_COMPACT_PERCENT } else { options.compact_percent }));
+    let compact_limit = window.saturating_mul(compact_percent) / 100;
+    if estimated > compact_limit && request_history.len() > 16 {
         let summarized_turns = request_history.len() - 12;
         send(StreamEvent {
             tool_name: Some("compact_context".to_owned()),
@@ -556,6 +695,7 @@ pub fn respond_with_tools(
             account_id,
             model,
             &current_summary,
+            options.session_id.as_deref(),
             &request_history[..summarized_turns],
             &http,
             &send,
@@ -570,16 +710,30 @@ pub fn respond_with_tools(
         });
     }
     let mut input = conversation_input(&current_summary, &request_history, user_message);
+    let mut compose_active = options.compose;
+    if compose_active {
+        input.push(json!({"role":"developer","content":COMPOSE_PROMPT}));
+    }
+    for text in &options.extra_developer {
+        if !text.trim().is_empty() {
+            input.push(json!({"role":"developer","content":text}));
+        }
+    }
+    let mut stop_retries = 0_u8;
+    let mut last_input_tokens = 0_u64;
     let mut answer = String::new();
-    let mut tool_rounds = 0;
     let mut call_sequence = 0_u64;
+    let mut message_sequence = 0_u64;
     let mut desktop_send_attempted = false;
-    let force_connection_inventory = is_connection_inventory_question(user_message);
+    // A worker's task brief or a long coding request that merely mentions servers or tools is
+    // not a status question; only a short, direct one is answered from the live inventory.
+    let inventory_question = !options.worker && is_connection_inventory_question(user_message);
+    let force_connection_inventory = inventory_question;
     let mut connection_inventory_requested = false;
     let mut actions_waiting_for_snapshot: Vec<ToolActivity> = Vec::new();
     let mut completion_diagnostics = "completion metadata unavailable".to_owned();
     let mut visible_delta_sent = false;
-    let research_task = requires_research_evidence(user_message);
+    let research_task = !options.worker && requires_research_evidence(user_message);
     let mut research_evidence_rows = 0_usize;
     let mut evidence_retry_count = 0_u8;
 
@@ -587,6 +741,34 @@ pub fn respond_with_tools(
         if crate::jev::cancel_requested() {
             return Err("Run cancelled.".into());
         }
+        if let Some(poll) = options.inbox.as_ref() {
+            for message in poll() {
+                // A message from the user or another agent shows up as its own row in the tool list.
+                if let Some((from, text)) = message.strip_prefix("[message from ").and_then(|rest| rest.split_once("] ")) {
+                    message_sequence += 1;
+                    let from = from.split(',').next().unwrap_or(from).trim().to_owned();
+                    send(StreamEvent {
+                        tool_activity: Some(ToolActivity {
+                            id: format!("message-{message_sequence}-{}", input.len()),
+                            name: "message_received".into(),
+                            arguments_summary: format!("from {from}"),
+                            arguments_detail: json!({"from": from}).to_string(),
+                            result_summary: "Delivered to the model".into(),
+                            result_detail: text.to_owned(),
+                            state: "complete".into(),
+                        }),
+                        ..Default::default()
+                    });
+                }
+                input.push(json!({"role":"user","content":message}));
+            }
+        }
+        if last_input_tokens > compact_limit {
+            if trim_old_tool_outputs(&mut input, 12) > 0 {
+                last_input_tokens = 0;
+            }
+        }
+        let tools_for_round = request_tools(&tools, compose_active, &options.hidden_tools);
         // Measure one ChatGPT round trip at a time. The total JEV task may
         // include several model rounds and local tool execution, so it must
         // not be presented as a single model-request duration.
@@ -600,12 +782,22 @@ pub fn respond_with_tools(
         } else {
             json!("auto")
         };
+        // This private ChatGPT backend refuses `store: true`, so JARVUS re-sends its
+        // persisted local history on each turn. The stable key is cache affinity, not a
+        // server-issued conversation/session id and not a guarantee of server-held history.
+        let mut body = json!({"model":model,"reasoning":{"effort":reasoning_effort},"input":input,"tools":tools_for_round,"tool_choice":tool_choice,"parallel_tool_calls":false,"store":false,"stream":true});
+        if let Some(session) = options.session_id.as_deref() {
+            body["prompt_cache_key"] = json!(session);
+        }
         let mut request = stream_http.post("https://chatgpt.com/backend-api/codex/responses")
             .bearer_auth(access_token)
             .header("originator", "codex_cli_rs")
             .header(reqwest::header::USER_AGENT, format!("JARVUS/{}", env!("CARGO_PKG_VERSION")))
             .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&json!({"model":model,"reasoning":{"effort":reasoning_effort},"input":input,"tools":tools,"tool_choice":tool_choice,"parallel_tool_calls":false,"store":false,"stream":true}));
+            .json(&body);
+        if let Some(session) = options.session_id.as_deref() {
+            request = request.header("session_id", session);
+        }
         if let Some(id) = account_id {
             request = request.header("ChatGPT-Account-ID", id);
         }
@@ -690,6 +882,7 @@ pub fn respond_with_tools(
                         }
                         completion_diagnostics = response_diagnostics(response_value);
                         if let Some(usage) = parse_usage(response_value.get("usage")) {
+                            last_input_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
                             send(StreamEvent {
                                 usage: Some(usage),
                                 ..Default::default()
@@ -722,6 +915,16 @@ pub fn respond_with_tools(
             .cloned()
             .collect();
         if calls.is_empty() {
+            if let Some(hold) = options.hold_for_team.as_ref() {
+                let notes = hold();
+                if !notes.is_empty() {
+                    input.extend(output);
+                    for note in notes {
+                        input.push(json!({"role":"user","content":note}));
+                    }
+                    continue;
+                }
+            }
             match research_completion_gate(
                 research_task,
                 research_evidence_rows,
@@ -759,6 +962,11 @@ pub fn respond_with_tools(
                     delta: Some(answer.clone()),
                     ..Default::default()
                 });
+                if let Some(reason) = stop_hook_reason(&options, &answer, &mut stop_retries) {
+                    input.extend(output);
+                    input.push(json!({"role":"developer","content":format!("A Stop hook asked you to keep working before finishing: {reason}")}));
+                    continue;
+                }
                 return Ok(answer);
             }
             if answer.trim().is_empty() {
@@ -780,21 +988,41 @@ pub fn respond_with_tools(
                     ..Default::default()
                 });
             }
+            if let Some(reason) = stop_hook_reason(&options, &answer, &mut stop_retries) {
+                input.extend(output);
+                input.push(json!({"role":"developer","content":format!("A Stop hook asked you to keep working before finishing: {reason}")}));
+                continue;
+            }
             return Ok(answer);
         }
-        tool_rounds += 1;
-        if tool_rounds > 48 {
-            return Err("JEV stopped after 48 tool rounds to keep this task bounded. Partial work is saved; ask JEV to continue from the latest verified state.".into());
-        }
-
         // Preserve every output item (including reasoning items) when returning
         // the matching function_call_output items to the Responses API.
         input.extend(output);
+        // Whatever the model said alongside its tool calls is progress narration for the user:
+        // show it (research prose is held back only for the final answer) and keep paragraphs apart.
+        if research_task {
+            let narration = std::mem::take(&mut buffered_research_text);
+            if !narration.trim().is_empty() {
+                answer.push_str(&narration);
+                send(StreamEvent { delta: Some(narration), ..Default::default() });
+            }
+        }
+        if !answer.is_empty() && !answer.ends_with("
+
+") {
+            answer.push_str("
+
+");
+            send(StreamEvent { delta: Some("
+
+".into()), ..Default::default() });
+        }
         // JEV finishing ChatGPT's plan ends the turn here with the reply ChatGPT
         // wrote up front, so a successful task costs exactly one model request.
         let single_call = calls.len() == 1;
         let mut local_finish: Option<String> = None;
         let mut newly_loaded_tools: Vec<Value> = Vec::new();
+        let mut exit_compose_after_round = false;
         for call in calls {
             let call_id = call
                 .get("call_id")
@@ -837,7 +1065,26 @@ pub fn respond_with_tools(
                 tool_activity: Some(activity.clone()),
                 ..Default::default()
             });
-            let result = if should_block_desktop_send_followup(name, desktop_send_attempted) {
+            let gate_error = if options.hidden_tools.iter().any(|hidden| hidden == name) {
+                Some(format!("`{name}` is not available to you in this run."))
+            } else if compose_active {
+                crate::compose::tool_allowed(name, &arguments).err()
+            } else if name == "propose_plan" {
+                Some("propose_plan only works while Compose mode is on.".to_owned())
+            } else {
+                None
+            };
+            if gate_error.is_none() && name == "propose_plan" {
+                if let Some(plan) = arguments.get("plan_markdown").and_then(Value::as_str) {
+                    let block = format!("\n\n**Proposed plan**\n\n{}\n\n", plan.trim());
+                    answer.push_str(&block);
+                    send(StreamEvent { delta: Some(block), ..Default::default() });
+                    visible_delta_sent = true;
+                }
+            }
+            let result = if let Some(error) = gate_error {
+                json!({"ok":false,"error":error})
+            } else if should_block_desktop_send_followup(name, desktop_send_attempted) {
                 json!({"ok":false,"error":"desktop_send already ran for this request. Do not repeat or fall back to separate typing, readback, key, or click actions; use the returned status and fresh observation."})
             } else if should_block_low_level_send_input(name, explicit_send_requested) {
                 json!({"ok":false,"error":"This request explicitly asks JEV to send a message. Use desktop_send with the fresh unique composer ref and exact user-authorized text; separate typing or key submission is unavailable."})
@@ -878,7 +1125,7 @@ pub fn respond_with_tools(
                 // Connection inventory is a direct live fact, not a reasoning
                 // task. Return the locally refreshed summary verbatim so the
                 // model cannot omit a connected bridge from the answer.
-                if name == "list_mcps" && is_connection_inventory_question(user_message) {
+                if name == "list_mcps" && inventory_question {
                     local_finish = result
                         .pointer("/result/answer_hint")
                         .and_then(Value::as_str)
@@ -941,7 +1188,10 @@ pub fn respond_with_tools(
                 tool_activity: Some(activity),
                 ..Default::default()
             });
-            let model_result = compact_agent_output(&result);
+            if name == "propose_plan" && result.pointer("/result/decision").and_then(Value::as_str) == Some("accepted") {
+                exit_compose_after_round = true;
+            }
+            let model_result = model_output(name, &result);
             let model_result = if name == "jev_run_plan"
                 && arguments.get("final").and_then(Value::as_bool) != Some(true)
             {
@@ -954,6 +1204,10 @@ pub fn respond_with_tools(
                 model_result
             };
             input.push(json!({"type":"function_call_output","call_id":call_id,"output":model_result.to_string()}));
+        }
+        if exit_compose_after_round && compose_active {
+            compose_active = false;
+            input.push(json!({"role":"developer","content":"Compose mode has ended: the user accepted your plan. All tools are unlocked. Carry the plan out now, verifying as you go, then report what you verified."}));
         }
         if let Some(available) = tools.as_array_mut() {
             for schema in newly_loaded_tools {
@@ -1074,33 +1328,23 @@ fn requires_goal_supervision(request: &str) -> bool {
 
 fn requires_research_evidence(request: &str) -> bool {
     let text = request.to_ascii_lowercase();
-    [
-        "research",
-        "search",
-        "look up",
-        "look for",
-        "find games",
-        "find me",
-        "browse",
-        "compare",
-        "summarize",
-        "summary",
-        "current",
-        "latest",
-        "active players",
-        "player count",
-        "more than",
-        "at least",
-        "over ",
-        "top ",
-        "sources",
-        "across sites",
-        "statistics",
-        "1k",
-        "1,000",
-    ]
-    .iter()
-    .any(|phrase| text.contains(phrase))
+    let has = |words: &[&str]| words.iter().any(|word| text.contains(word));
+    let web = has(&[
+        "online", "website", "web ", "web.", "internet", "google", "http", "www.", ".com", "news", "reddit", "roblox", "youtube",
+        "wikipedia", "price", "weather", "players", "games", "rating", "review", "trending", "rolimons", "stock", "store",
+    ]);
+    let local = has(&["folder", "file", "repo", "project", "directory", "src", "code", "codebase", "function", "cargo", "subagent"]);
+    if local && !web {
+        return false;
+    }
+    let strong = has(&[
+        "research", "search", "look up", "look for", "find games", "find me", "browse", "sources", "across sites", "statistics",
+        "active players", "player count",
+    ]);
+    let weak = has(&[
+        "compare", "summarize", "summary", "current", "latest", "more than", "at least", "over ", "top ", "1k", "1,000",
+    ]);
+    strong || (weak && web)
 }
 
 /// Evidence must come from a successful browser/search/extraction tool and
@@ -1631,6 +1875,31 @@ fn bounded_json(value: &Value, limit: usize) -> String {
     )
 }
 
+/// What the model sees of a tool result. Desktop (JEV) results are trimmed hard: raw accessibility
+/// trees stay local and every string is cut short. Everything else (Shell file and command output,
+/// Chrome pages, MCP tools, agent reports, skills) is real content the model asked for, so it
+/// passes through whole up to a generous cap instead of being clipped to a few hundred characters.
+fn model_output(name: &str, result: &Value) -> Value {
+    const LIMIT: usize = 60_000;
+    let passes_whole = name.starts_with("mcp__")
+        || name.starts_with("browser__")
+        || name.starts_with("agent_")
+        || matches!(name, "use_skill" | "install_skill" | "list_mcps" | "ask_user" | "propose_plan");
+    if !passes_whole {
+        return compact_agent_output(result);
+    }
+    let text = result.to_string();
+    let length = text.chars().count();
+    if length <= LIMIT {
+        return result.clone();
+    }
+    json!({
+        "truncated": true,
+        "note": format!("The result was {length} characters; only the first {LIMIT} are shown. Ask for a narrower slice (read_file `ranges`, a filter, a smaller page)."),
+        "partial": text.chars().take(LIMIT).collect::<String>(),
+    })
+}
+
 fn compact_agent_output(value: &Value) -> Value {
     fn compact(value: &Value, remaining: &mut usize, depth: usize) -> Value {
         if *remaining == 0 || depth > 8 {
@@ -1663,7 +1932,6 @@ fn compact_agent_output(value: &Value) -> Value {
             Value::Array(items) => Value::Array(
                 items
                     .iter()
-                    .take(48)
                     .map(|item| compact(item, remaining, depth + 1))
                     .collect(),
             ),
@@ -1677,12 +1945,15 @@ fn compact_agent_output(value: &Value) -> Value {
             _ => value.clone(),
         }
     }
-    let mut budget = 1200;
+    // Keep whole result lists searchable by the model. The former 48-item cap
+    // silently dropped late rows (for example, a DM near the bottom of a large
+    // list). Accessibility trees are still kept local and summarized separately.
+    let mut budget = 16_384;
     let safe = compact(value, &mut budget, 0);
     if serde_json::to_vec(&safe)
         .map(|bytes| bytes.len())
         .unwrap_or(usize::MAX)
-        <= 32_000
+        <= 96_000
     {
         safe
     } else {
@@ -1695,12 +1966,13 @@ fn compact_history(
     account_id: Option<&str>,
     model: &str,
     prior_summary: &str,
+    session_id: Option<&str>,
     old_turns: &[Turn],
     http: &Client,
     send: &impl Fn(StreamEvent),
 ) -> Result<String, String> {
     let mut input = vec![
-        json!({"role":"developer","content":SYSTEM_PROMPT}),
+        json!({"role":"developer","content":system_prompt()}),
         json!({"role":"developer","content":"Summarize older completed conversation turns for JEV. Preserve user goals, exact names and text still needed, decisions, constraints, safety boundaries, pending work, and verified outcomes. Remove incidental screen content and secrets. Do not perform desktop actions. Return a compact factual memory only."}),
     ];
     if !prior_summary.trim().is_empty() {
@@ -1709,18 +1981,25 @@ fn compact_history(
     input.extend(
         old_turns
             .iter()
-            .map(|turn| json!({"role":turn.role,"content":turn.content})),
+            .map(|turn| json!({"role":turn.role,"content":turn_model_text(turn)})),
     );
     input.push(
         json!({"role":"user","content":"Create the updated compacted conversation memory now."}),
     );
 
+    let mut body = json!({"model":model,"input":input,"tools":[],"tool_choice":"none","parallel_tool_calls":false,"store":false,"stream":true});
+    if let Some(session) = session_id {
+        body["prompt_cache_key"] = json!(session);
+    }
     let mut request = http.post("https://chatgpt.com/backend-api/codex/responses")
         .bearer_auth(access_token)
         .header("originator", "codex_cli_rs")
         .header(reqwest::header::USER_AGENT, format!("JARVUS/{}", env!("CARGO_PKG_VERSION")))
         .header(reqwest::header::ACCEPT, "text/event-stream")
-        .json(&json!({"model":model,"input":input,"tools":[],"tool_choice":"none","parallel_tool_calls":false,"store":false,"stream":true}));
+        .json(&body);
+    if let Some(session) = session_id {
+        request = request.header("session_id", session);
+    }
     if let Some(id) = account_id {
         request = request.header("ChatGPT-Account-ID", id);
     }
@@ -1800,7 +2079,7 @@ fn compact_history(
 
 fn conversation_input(summary: &str, history: &[Turn], user_message: &str) -> Vec<Value> {
     let mut input = vec![
-        json!({"role":"developer","content":SYSTEM_PROMPT}),
+        json!({"role":"developer","content":system_prompt()}),
         json!({"role":"developer","content":"ChatGPT plans; JEV tools execute. Use fresh Agent Desktop observations before every state-changing step."}),
     ];
     if !summary.trim().is_empty() {
@@ -1809,7 +2088,7 @@ fn conversation_input(summary: &str, history: &[Turn], user_message: &str) -> Ve
     input.extend(
         history
             .iter()
-            .map(|turn| json!({"role":turn.role,"content":turn.content})),
+            .map(|turn| json!({"role":turn.role,"content":turn_model_text(turn)})),
     );
     input.push(json!({"role":"user","content":user_message}));
     input
@@ -1820,7 +2099,7 @@ fn estimate_tokens(text: &str) -> u64 {
 }
 
 pub fn estimate_context_tokens(summary: &str, history: &[Turn], user_message: &str) -> u64 {
-    estimate_tokens(SYSTEM_PROMPT)
+    estimate_tokens(system_prompt())
         .saturating_add(estimate_tokens("ChatGPT plans; JEV tools execute. Use fresh Agent Desktop observations before every state-changing step."))
         .saturating_add(estimate_tokens(summary))
         .saturating_add(estimate_turns(history))
@@ -1828,14 +2107,76 @@ pub fn estimate_context_tokens(summary: &str, history: &[Turn], user_message: &s
 }
 
 pub fn system_prompt_tokens() -> u64 {
-    estimate_tokens(SYSTEM_PROMPT)
+    estimate_tokens(system_prompt())
 }
 
 fn estimate_turns(turns: &[Turn]) -> u64 {
     turns
         .iter()
-        .map(|turn| estimate_tokens(&turn.content).saturating_add(4))
+        .map(|turn| (turn.content.len() as u64 + digest_size_estimate(turn)).saturating_add(3) / 4 + 4)
         .sum()
+}
+
+const DIGEST_PER_CALL: usize = 700;
+const DIGEST_ARGS: usize = 220;
+const DIGEST_TOTAL: usize = 16_000;
+
+fn excerpt(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > max {
+        format!("{}…", flat.chars().take(max).collect::<String>())
+    } else {
+        flat
+    }
+}
+
+/// Bytes the tool digest of a turn adds to the model's context, without building it (the context
+/// gauge asks every frame).
+fn digest_size_estimate(turn: &Turn) -> u64 {
+    if turn.role != "assistant" || turn.tool_activity.is_empty() {
+        return 0;
+    }
+    let mut total = 160_usize;
+    for activity in turn.tool_activity.iter().rev() {
+        let args = if activity.arguments_detail.is_empty() { activity.arguments_summary.len() } else { activity.arguments_detail.len() };
+        let result = if activity.result_detail.is_empty() { activity.result_summary.len() } else { activity.result_detail.len() };
+        let line = args.min(DIGEST_ARGS) + result.min(DIGEST_PER_CALL) + activity.name.len() + 24;
+        if total + line > DIGEST_TOTAL {
+            break;
+        }
+        total += line;
+    }
+    total as u64
+}
+
+/// What the model is told a past turn contained: for an assistant turn, its reply plus a short
+/// digest of the tool calls it made and what they returned, so a follow-up message still knows
+/// what was already done and found instead of starting from the bare text.
+pub fn turn_model_text(turn: &Turn) -> String {
+    if turn.role != "assistant" || turn.tool_activity.is_empty() {
+        return turn.content.clone();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = 0_usize;
+    let mut omitted = 0_usize;
+    for activity in turn.tool_activity.iter().rev() {
+        let args = excerpt(if activity.arguments_detail.is_empty() { &activity.arguments_summary } else { &activity.arguments_detail }, DIGEST_ARGS);
+        let result = excerpt(if activity.result_detail.is_empty() { &activity.result_summary } else { &activity.result_detail }, DIGEST_PER_CALL);
+        let line = format!("- {} {args} -> [{}] {result}", activity.name, activity.state);
+        if omitted > 0 || used + line.len() > DIGEST_TOTAL {
+            omitted += 1;
+            continue;
+        }
+        used += line.len();
+        lines.push(line);
+    }
+    lines.reverse();
+    let note = if omitted > 0 { format!("; {omitted} earlier calls omitted") } else { String::new() };
+    format!(
+        "{}\n\n[Tool calls made during this reply — results shortened{note}; re-run a tool for full output]\n{}",
+        turn.content,
+        lines.join("\n")
+    )
 }
 
 fn parse_usage(value: Option<&Value>) -> Option<Usage> {
@@ -2212,26 +2553,18 @@ fn concise_error(body: &str) -> String {
 /// connectivity. This prevents the model from answering from saved context
 /// when a browser bridge is not an MCP child process.
 fn is_connection_inventory_question(message: &str) -> bool {
-    let text = message.to_lowercase();
-    let asks_for_status = [
-        "connected",
-        "connection",
-        "online",
-        "live",
-        "healthy",
-        "health",
-        "available",
-        "enabled",
-        "running",
-        "active",
-        "status",
-    ]
-    .iter()
-    .any(|word| text.contains(word));
-    let names_integration = ["mcp", "chrome", "browser", "integration", "server", "tools"]
+    let text = message.trim().to_lowercase();
+    // Direct status questions are short; briefs and coding requests are not.
+    if text.chars().count() > 160 || text.lines().count() > 2 {
+        return false;
+    }
+    let asks_for_status = ["connected", "connection", "online", "healthy", "health", "available", "enabled", "status", "list"]
         .iter()
         .any(|word| text.contains(word));
-    asks_for_status && names_integration
+    let names_integration = ["mcp", "chrome", "browser", "integration"].iter().any(|word| text.contains(word));
+    let question_form = text.ends_with('?')
+        || ["what", "which", "is ", "are ", "list", "show", "check", "do you have", "can you see"].iter().any(|start| text.starts_with(start));
+    asks_for_status && names_integration && question_form
 }
 
 #[cfg(test)]
@@ -2674,6 +3007,99 @@ mod tests {
     }
 
     #[test]
+    fn old_tool_outputs_are_trimmed_but_recent_ones_and_messages_are_kept() {
+        let big = "y".repeat(5_000);
+        let mut input = vec![
+            json!({"role":"user","content":big.clone()}),
+            json!({"type":"function_call_output","call_id":"1","output":big.clone()}),
+            json!({"type":"function_call_output","call_id":"2","output":"small"}),
+            json!({"type":"function_call_output","call_id":"3","output":big.clone()}),
+        ];
+        assert_eq!(trim_old_tool_outputs(&mut input, 1), 1);
+        assert!(input[1]["output"].as_str().unwrap().len() < 800);
+        assert!(input[1]["output"].as_str().unwrap().contains("trimmed"));
+        assert_eq!(input[0]["content"].as_str().unwrap().len(), 5_000, "user messages are never trimmed");
+        assert_eq!(input[2]["output"], "small");
+        assert_eq!(input[3]["output"].as_str().unwrap().len(), 5_000, "the newest output stays intact");
+    }
+
+    #[test]
+    fn only_short_direct_status_questions_count_as_connection_inventory_requests() {
+        assert!(is_connection_inventory_question("Is Chrome connected?"));
+        assert!(is_connection_inventory_question("what MCP servers are connected"));
+        assert!(is_connection_inventory_question("list my mcps"));
+        // A worker brief or coding request that merely mentions servers/running/tools is not one.
+        let brief = "Read-only inspect C:\\Projects\\FastLab (do not edit) and compare its architecture to the requested game: web visual UI, 100x headless training with live counters, Laya local HTTP model integration. Report exact file map, what is already implemented, commands to run, and technical gaps.";
+        assert!(!is_connection_inventory_question(brief));
+        assert!(!is_connection_inventory_question("start the dev server and tell me if it is running"));
+        assert!(!is_connection_inventory_question("fix the browser tab bug in app.rs"));
+    }
+
+    #[test]
+    fn tool_activity_is_never_dropped_and_only_old_details_are_cleared() {
+        let mut list = Vec::new();
+        for i in 0..150 {
+            record_activity(&mut list, ToolActivity { id: format!("c{i}"), result_detail: "x".repeat(50), state: "complete".into(), ..Default::default() });
+        }
+        assert_eq!(list.len(), 150);
+        assert!(list[0].result_detail.is_empty(), "old details are cleared");
+        assert!(!list[149].result_detail.is_empty(), "recent details stay");
+        record_activity(&mut list, ToolActivity { id: "c149".into(), state: "failed".into(), ..Default::default() });
+        assert_eq!((list.len(), list[149].state.as_str()), (150, "failed"), "an update replaces, not appends");
+    }
+
+    #[test]
+    fn shell_and_agent_results_reach_the_model_whole_but_desktop_results_stay_trimmed() {
+        let long = "z".repeat(5_000);
+        let shell = json!({"ok":true,"result":{"content":long.clone()}});
+        assert_eq!(model_output("mcp__jarvus_shell__read_file", &shell), shell);
+        assert_eq!(model_output("agent_read", &json!({"result":long.clone()}))["result"].as_str().unwrap().len(), 5_000);
+        let desktop = model_output("desktop_find", &json!({"text":long.clone()}));
+        assert!(desktop["text"].as_str().unwrap().chars().count() <= 241);
+        let huge = json!({"stdout":"q".repeat(100_000)});
+        let capped = model_output("mcp__jarvus_shell__run_command", &huge);
+        assert_eq!(capped["truncated"], true);
+        assert_eq!(capped["partial"].as_str().unwrap().chars().count(), 60_000);
+    }
+
+    #[test]
+    fn past_turns_carry_a_digest_of_their_tool_calls_to_the_next_request() {
+        let turn = Turn {
+            role: "assistant".into(),
+            content: "Done.".into(),
+            tool_activity: vec![ToolActivity {
+                id: "1".into(),
+                name: "mcp__jarvus_shell__run_command".into(),
+                arguments_detail: "{\"command\":\"dir\"}".into(),
+                result_detail: "{\"stdout\": \"a.txt   b.txt\"}".into(),
+                state: "complete".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let text = turn_model_text(&turn);
+        assert!(text.starts_with("Done."));
+        assert!(text.contains("run_command") && text.contains("a.txt b.txt"), "{text}");
+        let plain = Turn { role: "user".into(), content: "hi".into(), ..Default::default() };
+        assert_eq!(turn_model_text(&plain), "hi");
+        assert!(digest_size_estimate(&turn) > 0 && digest_size_estimate(&plain) == 0);
+        let input = conversation_input("", std::slice::from_ref(&turn), "next");
+        assert!(input.iter().any(|item| item["content"].as_str().is_some_and(|c| c.contains("a.txt b.txt"))));
+        // a long run never grows without bound
+        let mut big = turn.clone();
+        big.tool_activity = (0..500).map(|i| ToolActivity { id: i.to_string(), name: "t".into(), result_detail: "r".repeat(5_000), state: "complete".into(), ..Default::default() }).collect();
+        assert!(turn_model_text(&big).len() < 18_000 + 400);
+        assert!(turn_model_text(&big).contains("earlier calls omitted"));
+    }
+
+    #[test]
+    fn compact_percent_is_clamped_to_the_documented_range() {
+        assert_eq!(clamp_compact_percent(0), 15);
+        assert_eq!(clamp_compact_percent(80), 80);
+        assert_eq!(clamp_compact_percent(200), 95);
+    }
+
+    #[test]
     fn title_response_and_local_fallback_are_bounded_and_deterministic() {
         let long = "word ".repeat(30);
         let title = parse_title_response(&long, "unused");
@@ -2698,7 +3124,7 @@ mod tests {
             body.pointer("/input")
                 .and_then(Value::as_array)
                 .map(Vec::len),
-            Some(1)
+            Some(2)
         );
         assert_eq!(
             body.get("tools").and_then(Value::as_array).map(Vec::len),
@@ -2779,63 +3205,223 @@ mod tests {
         assert!(can_complete_with_inline_snapshot("desktop_click", &result));
     }
 
-    #[test]
-    fn named_app_and_control_workflows_reuse_fresh_observations() {
-        assert!(SYSTEM_PROMPT.contains("call open_app directly"));
-        assert!(SYSTEM_PROMPT.contains(
-            "Do not call desktop_list_apps first because open_app already performs that check."
-        ));
-        assert!(SYSTEM_PROMPT.contains("desktop_find only when that observation omits the target"));
-        assert!(
-            SYSTEM_PROMPT
-                .contains("A fresh post-action observation is already the next usable snapshot")
-        );
-        assert!(
-            SYSTEM_PROMPT
-                .contains("Call desktop_find only if the needed control is omitted or ambiguous.")
-        );
-        assert!(SYSTEM_PROMPT.contains("compact=false"));
-        assert!(SYSTEM_PROMPT.contains("target_text"));
-        assert!(SYSTEM_PROMPT.contains("interactive-only mode drops static row labels"));
-        assert!(SYSTEM_PROMPT.contains("Prefer the visible matching"));
+    fn flat(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     #[test]
-    fn exact_send_prompt_precedence_and_example_use_only_desktop_send() {
-        let send_rule = SYSTEM_PROMPT
-            .find("Exact send routing has priority")
-            .unwrap();
-        let generic_type_rule = SYSTEM_PROMPT
-            .find("Use desktop_type for text-only entry")
-            .unwrap();
-        assert!(
-            send_rule < generic_type_rule,
-            "send routing must precede generic typing guidance"
-        );
-        assert!(SYSTEM_PROMPT.contains("Do not call `desktop_type`, `desktop_get`, `desktop_press`, or `desktop_click` as part of"));
-        assert!(SYSTEM_PROMPT.contains("type_failure.kind`"));
-        let example = SYSTEM_PROMPT
-            .split("## Example B: send the exact message the user requested")
-            .nth(1)
-            .unwrap()
-            .split("## Example C:")
-            .next()
-            .unwrap();
-        assert_eq!(
-            example.matches("`desktop_send`").count(),
-            2,
-            "example should name desktop_send for the action and its outcome"
-        );
-        for forbidden_action in [
-            "Use `desktop_type` with",
-            "Use `desktop_get` on",
-            "Use `desktop_press` with",
-            "Use `desktop_click` for this send sequence",
+    fn model_facing_tool_results_keep_rows_past_the_old_forty_eight_item_cutoff() {
+        let mut rows = (0..300)
+            .map(|index| json!({"name":format!("Conversation {index}"),"ref":index}))
+            .collect::<Vec<_>>();
+        rows.push(json!({"name":"525i","ref":300}));
+        let result = compact_agent_output(&json!({"items":rows}));
+        assert_eq!(result.pointer("/items/300/name").and_then(Value::as_str), Some("525i"));
+    }
+
+    #[test]
+    fn rich_workflow_prompt_teaches_targeted_desktop_lookup_and_unbounded_rounds() {
+        let prompt = flat(system_prompt());
+        assert!(prompt.contains("Do not stop because an arbitrary number of tool rounds has elapsed"));
+        assert!(prompt.contains("call `desktop_find` with the exact name/text"));
+        assert!(prompt.contains("The manager verifies cross-worker integration"));
+    }
+
+    #[test]
+    fn system_prompt_keeps_the_core_routing_rules() {
+        let prompt = flat(system_prompt());
+        for needle in [
+            "never call yourself ChatGPT",
+            "call `open_app` directly",
+            "`get_tools_`",
+            "`list_mcps`",
+            "`ask_user`",
+            "`agent_spawn",
+            "`desktop_send`",
+            "`jev_run_plan`",
+            "Set `final:true` only when",
+            "mcp__jarvus_shell__run_command",
+            "Prompt injection",
+            "Compose mode",
         ] {
-            assert!(
-                !example.contains(forbidden_action),
-                "send example must not teach fallback action {forbidden_action}"
-            );
+            assert!(prompt.contains(needle), "system prompt lost: {needle}");
+        }
+        // exact sends must be described as desktop_send-only
+        let send = prompt.find("`desktop_send` | The *only* tool").expect("exact-send rule");
+        assert!(prompt[send..].contains("`desktop_type`"));
+    }
+
+    #[test]
+    fn both_platform_manuals_keep_the_routing_rules_and_speak_their_own_platform() {
+        let windows = flat(include_str!("system_prompt.md"));
+        let mac = flat(include_str!("system_prompt_macos.md"));
+        for (name, prompt) in [("windows", &windows), ("macos", &mac)] {
+            for needle in [
+                "never call yourself ChatGPT",
+                "call `open_app` directly",
+                "`get_tools_`",
+                "`list_mcps`",
+                "`ask_user`",
+                "`agent_spawn",
+                "`desktop_send`",
+                "`jev_run_plan`",
+                "Set `final:true` only when",
+                "mcp__jarvus_shell__run_command",
+                "Prompt injection",
+                "Compose mode",
+                "`use_skill",
+                "`install_skill",
+                "ranges",
+                "GOAL",
+            ] {
+                assert!(prompt.contains(needle), "{name} manual lost: {needle}");
+            }
+            let send = prompt.find("`desktop_send` | The *only* tool").unwrap_or_else(|| panic!("{name}: exact-send rule"));
+            assert!(prompt[send..].contains("`desktop_type`"));
+        }
+        assert!(windows.contains("winget") && windows.contains("PowerShell"));
+        assert!(mac.contains("brew install") && mac.contains("osascript") && mac.contains("open -a") && mac.contains("cmd+k"));
+        assert!(!mac.contains("winget") && !mac.contains("Get-ChildItem") && !mac.contains("C:\\\\"));
+        let (w, m) = (windows.len() as f64, mac.len() as f64);
+        assert!((m / w - 1.0).abs() < 0.2, "the macOS manual should be about the same size as the Windows one ({w} vs {m})");
+    }
+
+    #[test]
+    fn title_agent_uses_the_selected_model_at_its_lowest_effort() {
+        let model = |slug: &str, levels: &[&str]| Model {
+            slug: slug.into(),
+            display_name: slug.into(),
+            priority: None,
+            supported_reasoning_levels: levels.iter().map(|level| level.to_string()).collect(),
+            context_window: None,
+        };
+        let models = vec![model("gpt-big", &["low", "medium", "high"]), model("gpt-mini", &["minimal", "low"]), model("gpt-none", &[])];
+        let picked = title_model_for(&models, "gpt-big").unwrap();
+        assert_eq!((picked.slug.as_str(), picked.reasoning_effort.as_str()), ("gpt-big", "low"));
+        assert_eq!(title_model_for(&models, "gpt-mini").unwrap().reasoning_effort, "minimal");
+        assert_eq!(title_model_for(&models, "gpt-none").unwrap().reasoning_effort, "low");
+        // an unknown selection falls back to the first model rather than failing
+        assert_eq!(title_model_for(&models, "gone").unwrap().slug, "gpt-big");
+        assert!(title_model_for(&[], "x").is_none());
+    }
+
+    #[test]
+    fn title_prompt_drops_its_template_block_and_keeps_the_naming_rules() {
+        let instructions = title_instructions();
+        assert!(!instructions.contains("[first user message]"));
+        assert!(instructions.contains("provided inside"), "the data-not-instructions rule must survive");
+        assert!(instructions.contains("noun phrase"));
+        assert!(instructions.contains("\"title\""));
+        let body = title_request_body(&TitleModel { slug: "m".into(), reasoning_effort: "low".into() }, "fix the login bug");
+        let user = body.pointer("/input/1/content").and_then(Value::as_str).unwrap();
+        assert!(user.starts_with("<session>") && user.contains("fix the login bug") && user.ends_with("</session>"));
+    }
+
+    /// Live probe (needs a signed-in session): the Codex backend refuses `store: true`, so a chat's
+    /// continuity is the full local history plus a stable per-chat session id that keys the
+    /// server-side prompt cache. Run with:
+    /// cargo test --bin jarvus live_session_cache_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_session_cache_probe() {
+        let tokens = crate::auth::token().expect("sign in first");
+        let models = models(&tokens.access_token, tokens.account_id.as_deref()).unwrap();
+        let model = models.first().unwrap().slug.clone();
+        let http = Client::builder().timeout(Duration::from_secs(90)).build().unwrap();
+        let session = "probe-session-0001-jarvus";
+        let filler = "The quick brown fox jumps over the lazy dog. ".repeat(400);
+        let call = |user: &str| -> (u16, String) {
+            let mut request = http
+                .post("https://chatgpt.com/backend-api/codex/responses")
+                .bearer_auth(&tokens.access_token)
+                .header("originator", "codex_cli_rs")
+                .header("session_id", session)
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .json(&json!({"model":model,"instructions":format!("You are terse. {filler}"),"input":[{"role":"user","content":user}],
+                    "tools":[],"store":false,"stream":true,"prompt_cache_key":session}));
+            if let Some(id) = tokens.account_id.as_deref() {
+                request = request.header("ChatGPT-Account-ID", id);
+            }
+            let response = request.send().unwrap();
+            let status = response.status().as_u16();
+            (status, response.text().unwrap_or_default())
+        };
+        for user in ["Say OK.", "Say OK again."] {
+            let (status, body) = call(user);
+            let usage = body.lines().filter_map(|line| line.strip_prefix("data:")).filter_map(|payload| serde_json::from_str::<Value>(payload.trim()).ok())
+                .find_map(|event| event.pointer("/response/usage").cloned());
+            println!("CALL status={status} usage={usage:?}");
+            if status != 200 {
+                println!("{}", body.chars().take(400).collect::<String>());
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_plan_steps_run_commands_and_stop_on_failure() {
+        let temp = std::env::temp_dir().to_string_lossy().into_owned();
+        let ok = crate::jev::run_plan(&json!({"steps":[
+            {"do":"shell","text":"Write-Output plan-step-ok","target":temp,"ms":20000},
+            {"do":"wait","ms":10}
+        ],"done_message":"","final":false}))
+        .unwrap();
+        assert_eq!(ok["status"], "completed", "{ok}");
+        assert!(ok["completed_steps"][0]["detail"]["stdout"].as_str().unwrap().contains("plan-step-ok"), "{ok}");
+
+        let failed = crate::jev::run_plan(&json!({"steps":[
+            {"do":"shell","text":"[Console]::Error.WriteLine('boom'); exit 3","target":temp,"ms":20000},
+            {"do":"wait","ms":10}
+        ],"done_message":"","final":false}))
+        .unwrap();
+        assert_eq!(failed["status"], "stopped");
+        assert_eq!(failed["failed_step"]["do"], "shell");
+        assert!(failed["failed_step"]["reason"].as_str().unwrap().contains("boom"), "{failed}");
+        assert_eq!(failed["completed_steps"].as_array().map(Vec::len), Some(0));
+
+        let missing = crate::jev::run_plan(&json!({"steps":[{"do":"shell","text":null,"target":null}],"done_message":"","final":false})).unwrap();
+        assert_eq!(missing["status"], "stopped");
+    }
+
+    #[test]
+    fn research_gate_ignores_local_work_but_catches_web_research() {
+        assert!(!requires_research_evidence("count the .rs files in the src folder of the current project"));
+        assert!(!requires_research_evidence("search the codebase for the function that sends messages"));
+        assert!(!requires_research_evidence("use two subagents to summarize the latest changes in this repo"));
+        assert!(requires_research_evidence("look on roblox for games with more than 1K active players"));
+        assert!(requires_research_evidence("research the latest news about rust on the web"));
+        assert!(requires_research_evidence("search for the best restaurants"));
+        assert!(!requires_research_evidence("open discord"));
+    }
+
+    #[test]
+    fn compose_mode_filters_tools_and_hides_propose_plan_otherwise() {
+        let tools = json!([
+            {"name":"propose_plan"}, {"name":"ask_user"}, {"name":"desktop_click"},
+            {"name":"mcp__jarvus_shell__read_file"}, {"name":"mcp__jarvus_shell__write_file"}, {"name":"mcp__jarvus_shell__run_command"}
+        ]);
+        let names = |value: Value| value.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        let composing = names(request_tools(&tools, true, &[]));
+        assert!(composing.contains(&"propose_plan".to_owned()));
+        assert!(composing.contains(&"mcp__jarvus_shell__read_file".to_owned()));
+        assert!(!composing.contains(&"desktop_click".to_owned()));
+        assert!(!composing.contains(&"mcp__jarvus_shell__write_file".to_owned()));
+        let normal = names(request_tools(&tools, false, &[]));
+        assert!(!normal.contains(&"propose_plan".to_owned()));
+        assert!(normal.contains(&"desktop_click".to_owned()));
+        let hidden = names(request_tools(&tools, false, &["ask_user".to_owned()]));
+        assert!(!hidden.contains(&"ask_user".to_owned()));
+    }
+
+    #[test]
+    fn compose_and_subagent_prompts_describe_their_protocols() {
+        let compose = flat(COMPOSE_PROMPT);
+        for needle in ["propose_plan", "ask_user", "read-only"] {
+            assert!(compose.contains(needle), "compose prompt lost: {needle}");
+        }
+        let worker = flat(include_str!("subagent_prompt.md"));
+        for needle in ["{name}", "agent_send", "main"] {
+            assert!(worker.contains(needle), "subagent prompt lost: {needle}");
         }
     }
 

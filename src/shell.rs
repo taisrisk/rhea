@@ -16,12 +16,13 @@ use std::{
 };
 
 const MAX_FILE_BYTES: usize = 512 * 1024;
+const MAX_READ_LINES: usize = 4_000;
 const MAX_COMMAND_OUTPUT: usize = 128 * 1024;
 const MAX_FETCH_BYTES: usize = 256 * 1024;
 const DEFAULT_FETCH_BYTES: usize = 32 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 500;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 30_000;
-const MAX_COMMAND_TIMEOUT_MS: u64 = 180_000;
+const MAX_COMMAND_TIMEOUT_MS: u64 = 900_000;
 
 #[derive(Default)]
 struct CapturedOutput {
@@ -68,14 +69,28 @@ fn run_command(args: &Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS)
         .clamp(1_000, MAX_COMMAND_TIMEOUT_MS);
+    let shell = args.get("shell").and_then(Value::as_str).unwrap_or("auto");
+    let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
 
-    let mut command = platform_shell(command_text);
-    command
-        .current_dir(working_directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = shell_command(shell, command_text)?;
+    command.current_dir(working_directory).stdin(Stdio::null());
     configure_hidden_process(&mut command);
+    if detach {
+        // Background start (servers, GUI installers, launching programs): nothing is captured
+        // and nothing is waited for; the caller gets the pid.
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let child = command
+            .spawn()
+            .map_err(|error| format!("Could not start the Shell command: {error}"))?;
+        return Ok(json!({
+            "detached": true,
+            "pid": child.id(),
+            "success": true,
+            "note": "Started in the background. Verify it is up (for example check its port or process) before relying on it.",
+            "working_directory": working_directory.display().to_string(),
+        }));
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|error| format!("Could not start the Shell command: {error}"))?;
@@ -94,19 +109,25 @@ fn run_command(args: &Value) -> Result<Value, String> {
     let started = Instant::now();
     let deadline = started + Duration::from_millis(timeout_ms);
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
+            Ok(None) if crate::jev::cancel_requested() => {
+                cancelled = true;
+                kill_process_tree(&mut child);
+                break child.wait().ok();
+            }
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(25));
             }
             Ok(None) => {
                 timed_out = true;
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 break child.wait().ok();
             }
             Err(error) => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 let _ = child.wait();
                 return Err(format!("Failed while waiting for Shell command: {error}"));
             }
@@ -132,6 +153,9 @@ fn run_command(args: &Value) -> Result<Value, String> {
     if let Some(reader) = stderr_reader.filter(|reader| reader.is_finished()) {
         let _ = reader.join();
     }
+    if cancelled {
+        return Err("Run cancelled.".into());
+    }
 
     let stdout = snapshot_capture(&stdout_capture);
     let stderr = snapshot_capture(&stderr_capture);
@@ -147,7 +171,74 @@ fn run_command(args: &Value) -> Result<Value, String> {
         "stdout_truncated": stdout.truncated,
         "stderr_truncated": stderr.truncated,
         "working_directory": working_directory.display().to_string(),
+        "shell": shell,
     }))
+}
+
+/// Kill the shell and everything it started (a plain `kill` leaves grandchildren running).
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(target_os = "windows")]
+    {
+        let mut kill = Command::new("taskkill");
+        kill.args(["/T", "/F", "/PID", &child.id().to_string()]).stdout(Stdio::null()).stderr(Stdio::null());
+        configure_hidden_process(&mut kill);
+        let _ = kill.status();
+    }
+    let _ = child.kill();
+}
+
+/// Build the process for a requested shell. `auto` is the platform default.
+fn shell_command(shell: &str, command_text: &str) -> Result<Command, String> {
+    let shell = shell.trim().to_ascii_lowercase();
+    match shell.as_str() {
+        "" | "auto" => Ok(platform_shell(command_text)),
+        "powershell" | "pwsh" => {
+            let mut command = Command::new(if cfg!(windows) { "powershell.exe" } else { "pwsh" });
+            command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &powershell_script(command_text)]);
+            Ok(command)
+        }
+        "cmd" => {
+            if !cfg!(windows) {
+                return Err("shell \"cmd\" only exists on Windows.".into());
+            }
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/S", "/C", command_text]);
+            Ok(command)
+        }
+        "bash" | "sh" | "zsh" => {
+            let program = find_unix_shell(&shell).ok_or_else(|| {
+                format!("`{shell}` is not installed or not on PATH (on Windows install Git for Windows for bash).")
+            })?;
+            let mut command = Command::new(program);
+            command.args(["-lc", command_text]);
+            Ok(command)
+        }
+        other => Err(format!("Unknown shell '{other}'. Use auto, powershell, cmd, bash, sh or zsh.")),
+    }
+}
+
+fn find_unix_shell(name: &str) -> Option<std::path::PathBuf> {
+    if !cfg!(windows) {
+        return ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+            .iter()
+            .map(|dir| Path::new(dir).join(name))
+            .find(|path| path.is_file());
+    }
+    let mut candidates = vec![
+        std::path::PathBuf::from(r"C:\Program Files\Git\bin").join(format!("{name}.exe")),
+        std::path::PathBuf::from(r"C:\Program Files (x86)\Git\bin").join(format!("{name}.exe")),
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            candidates.push(dir.join(format!("{name}.exe")));
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// PowerShell's default output encoding mangles non-ASCII text; force UTF-8.
+fn powershell_script(command_text: &str) -> String {
+    format!("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); $OutputEncoding = [Console]::OutputEncoding; {command_text}")
 }
 
 fn platform_shell(command_text: &str) -> Command {
@@ -159,7 +250,7 @@ fn platform_shell(command_text: &str) -> Command {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            command_text,
+            &powershell_script(command_text),
         ]);
         command
     }
@@ -263,6 +354,10 @@ fn list_directory(args: &Value) -> Result<Value, String> {
 
 fn read_file(args: &Value) -> Result<Value, String> {
     let path = Path::new(required_string(args, "path")?);
+    let ranges: Vec<&str> = args.get("ranges").and_then(Value::as_array).map(|items| items.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    if !ranges.is_empty() {
+        return read_line_ranges(path, &ranges);
+    }
     let limit = args
         .get("max_bytes")
         .and_then(Value::as_u64)
@@ -281,6 +376,61 @@ fn read_file(args: &Value) -> Result<Value, String> {
     Ok(
         json!({"path":path.display().to_string(),"content":content,"bytes_read":content.len(),"truncated":truncated}),
     )
+}
+
+/// The whole text of a file for line-based work (bounded like every other file operation).
+fn read_text_for_lines(path: &Path) -> Result<String, String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    if metadata.len() > MAX_FILE_BYTES as u64 {
+        return Err(format!("{} exceeds the {MAX_FILE_BYTES}-byte limit for line-based access; use run_command to slice it.", path.display()));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    String::from_utf8(bytes).map_err(|_| format!("{} is not valid UTF-8 text.", path.display()))
+}
+
+/// "5", "2-9", "40-" (to the end) -> 1-based inclusive (start, end); `end` is None for "to the end".
+fn parse_line_range(text: &str) -> Result<(usize, Option<usize>), String> {
+    let text = text.trim();
+    let bad = || format!("'{text}' is not a line range; use \"5\", \"2-9\" or \"40-\" (1-based, inclusive).");
+    let (start, end) = match text.split_once('-') {
+        Some((start, end)) => (start.trim(), end.trim()),
+        None => (text, text),
+    };
+    let start: usize = start.parse().map_err(|_| bad())?;
+    if start == 0 {
+        return Err(bad());
+    }
+    let end = if end.is_empty() { None } else { Some(end.parse::<usize>().map_err(|_| bad())?) };
+    Ok((start, end))
+}
+
+fn read_line_ranges(path: &Path, ranges: &[&str]) -> Result<Value, String> {
+    let content = read_text_for_lines(path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let mut out = Vec::new();
+    let mut emitted = 0_usize;
+    let mut truncated = false;
+    for spec in ranges {
+        let (start, end) = parse_line_range(spec)?;
+        let end = end.unwrap_or(total).min(total);
+        if start > total.max(1) || end < start {
+            out.push(json!({"range": spec, "error": format!("The file has {total} lines; nothing in {spec}."), "content": ""}));
+            continue;
+        }
+        let mut text = String::new();
+        for number in start..=end {
+            if emitted >= MAX_READ_LINES {
+                truncated = true;
+                break;
+            }
+            text.push_str(&format!("{number}| {}\n", lines[number - 1]));
+            emitted += 1;
+        }
+        out.push(json!({"range": spec, "start": start, "end": end, "content": text}));
+    }
+    Ok(json!({"path": path.display().to_string(), "total_lines": total, "ranges": out, "truncated": truncated,
+        "note": "Each line is shown as `number| text`; the number and bar are not part of the file."}))
 }
 
 fn write_file(args: &Value) -> Result<Value, String> {
@@ -312,6 +462,96 @@ fn write_file(args: &Value) -> Result<Value, String> {
 }
 
 fn edit_file(args: &Value) -> Result<Value, String> {
+    let edits = args.get("edits").and_then(Value::as_array).filter(|items| !items.is_empty());
+    let has_text_mode = args.get("find").and_then(Value::as_str).is_some_and(|text| !text.is_empty());
+    match (edits, has_text_mode) {
+        (Some(edits), false) => edit_by_lines(Path::new(required_string(args, "path")?), edits),
+        (None, true) => edit_by_text(args),
+        (Some(_), true) => Err("Give either `edits` (line ranges) or `find`/`replace`, not both.".into()),
+        (None, false) => Err("edit_file needs `edits` (a list of {lines, replacement}) or `find`/`replace`.".into()),
+    }
+}
+
+struct LineEdit {
+    /// 1-based first line replaced; `end` is the last (start - 1 means a pure insert before `start`).
+    start: usize,
+    end: usize,
+    text: String,
+    spec: String,
+}
+
+/// Apply several line-range replacements to one file in a single atomic write. Every range refers
+/// to the file as it was when read, so the edits never shift each other.
+fn edit_by_lines(path: &Path, edits: &[Value]) -> Result<Value, String> {
+    let content = read_text_for_lines(path)?;
+    let eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let total = lines.len();
+    let last_unterminated = lines.last().is_some_and(|line| !line.ends_with('\n'));
+    let mut parsed: Vec<LineEdit> = Vec::new();
+    for (index, edit) in edits.iter().enumerate() {
+        let spec = edit.get("lines").and_then(Value::as_str).ok_or_else(|| format!("edits[{index}] needs `lines` (e.g. \"2-5\")."))?;
+        let text = edit.get("replacement").and_then(Value::as_str).ok_or_else(|| format!("edits[{index}] needs `replacement` (use \"\" to delete the lines)."))?;
+        let (start, end) = parse_line_range(spec).map_err(|e| format!("edits[{index}]: {e}"))?;
+        let end = end.ok_or_else(|| format!("edits[{index}]: give an explicit end line (\"{start}-{}\"); to insert before line {start} use \"{start}-{}\".", total.max(start), start - 1))?;
+        if start > total + 1 || end > total || end + 1 < start {
+            return Err(format!("edits[{index}] '{spec}' is outside the file ({total} lines). Nothing was written."));
+        }
+        parsed.push(LineEdit { start, end, text: text.to_owned(), spec: spec.trim().to_owned() });
+    }
+    parsed.sort_by_key(|edit| (edit.start, edit.end));
+    for pair in parsed.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        // Half-open [start, end + 1): overlapping ranges, or an insert strictly inside another range.
+        if b.start < a.end + 1 {
+            return Err(format!("Edits '{}' and '{}' overlap. Nothing was written.", a.spec, b.spec));
+        }
+    }
+    let mut output: Vec<String> = Vec::with_capacity(total + 8);
+    let mut cursor = 1_usize;
+    let mut report = Vec::new();
+    let mut new_line = 1_usize;
+    for edit in &parsed {
+        while cursor < edit.start {
+            output.push(lines[cursor - 1].to_owned());
+            cursor += 1;
+            new_line += 1;
+        }
+        let body = edit.text.strip_suffix("\r\n").or_else(|| edit.text.strip_suffix('\n')).unwrap_or(&edit.text);
+        let new_lines: Vec<&str> = if edit.text.is_empty() { Vec::new() } else { body.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line)).collect() };
+        let reaches_unterminated_end = last_unterminated && edit.end == total && total > 0;
+        for (i, line) in new_lines.iter().enumerate() {
+            let terminated = !(reaches_unterminated_end && i + 1 == new_lines.len());
+            output.push(format!("{line}{}", if terminated { eol } else { "" }));
+        }
+        let removed = edit.end + 1 - edit.start;
+        let first = new_line;
+        new_line += new_lines.len();
+        report.push(json!({"lines": edit.spec, "replaced_lines": removed, "new_lines": new_lines.len(),
+            "now_at": if new_lines.is_empty() { Value::Null } else { json!(format!("{}-{}", first, new_line - 1)) },
+            "preview": new_lines.iter().enumerate().take(30).map(|(i, line)| format!("{}| {line}", first + i)).collect::<Vec<_>>().join("\n")}));
+        cursor = edit.end + 1;
+    }
+    while cursor <= total {
+        output.push(lines[cursor - 1].to_owned());
+        cursor += 1;
+    }
+    lines.clear();
+    let updated: String = output.concat();
+    if updated.len() > MAX_FILE_BYTES {
+        return Err(format!("The edited file would exceed the {MAX_FILE_BYTES}-byte limit. Nothing was written."));
+    }
+    let temp = path.with_extension(format!("{}.jarvus-edit", path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
+    fs::write(&temp, &updated).map_err(|error| format!("Could not stage the edit: {error}"))?;
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("Could not update {}: {error}", path.display()));
+    }
+    Ok(json!({"path": path.display().to_string(), "edits_applied": parsed.len(), "lines_before": total,
+        "lines_after": updated.lines().count(), "bytes_written": updated.len(), "edits": report}))
+}
+
+fn edit_by_text(args: &Value) -> Result<Value, String> {
     let path = Path::new(required_string(args, "path")?);
     let old = args
         .get("find")
@@ -457,6 +697,66 @@ mod tests {
     }
 
     #[test]
+    fn run_command_schema_exposes_shell_detach_and_long_timeouts() {
+        let tools = tool_specs();
+        let run = tools.as_array().unwrap().iter().find(|tool| tool["name"] == "mcp__jarvus_shell__run_command").unwrap();
+        let properties = run["parameters"]["properties"].as_object().unwrap();
+        for key in ["command", "working_directory", "timeout_ms", "shell", "detach"] {
+            assert!(properties.contains_key(key), "missing {key}");
+        }
+        assert_eq!(run["parameters"]["required"].as_array().unwrap().len(), properties.len(), "strict schemas list every property");
+    }
+
+    #[test]
+    fn unknown_or_unavailable_shells_are_rejected_cleanly() {
+        let directory = temporary_directory("badshell");
+        let error = execute("mcp__jarvus_shell__run_command", &json!({"command":"echo hi","working_directory":directory.to_str().unwrap(),"shell":"fish","detach":null,"timeout_ms":null})).unwrap_err();
+        assert!(error.contains("Unknown shell"), "{error}");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shells_cmd_powershell_and_utf8_output() {
+        let directory = temporary_directory("shells");
+        let dir = directory.to_str().unwrap();
+        let cmd = execute("mcp__jarvus_shell__run_command", &json!({"command":"echo from-cmd","working_directory":dir,"shell":"cmd","detach":null,"timeout_ms":null})).unwrap();
+        assert_eq!(cmd["success"], true);
+        assert!(cmd["stdout"].as_str().unwrap().contains("from-cmd"));
+        let ps = execute("mcp__jarvus_shell__run_command", &json!({"command":"Write-Output 'héllo ✓'","working_directory":dir,"shell":"powershell","detach":null,"timeout_ms":null})).unwrap();
+        assert!(ps["stdout"].as_str().unwrap().contains("héllo ✓"), "{ps}");
+        let failing = execute("mcp__jarvus_shell__run_command", &json!({"command":"exit 7","working_directory":dir,"shell":null,"detach":null,"timeout_ms":null})).unwrap();
+        assert_eq!(failing["success"], false);
+        assert_eq!(failing["exit_code"], 7);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detached_commands_return_a_pid_without_waiting() {
+        let directory = temporary_directory("detach");
+        let started = Instant::now();
+        let result = execute("mcp__jarvus_shell__run_command", &json!({"command":"Start-Sleep 20","working_directory":directory.to_str().unwrap(),"shell":null,"detach":true,"timeout_ms":null})).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(result["detached"], true);
+        let pid = result["pid"].as_u64().unwrap();
+        assert!(pid > 0);
+        let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn timeouts_kill_the_whole_process_tree() {
+        let directory = temporary_directory("tree");
+        let started = Instant::now();
+        let result = execute("mcp__jarvus_shell__run_command", &json!({"command":"Start-Sleep 30","working_directory":directory.to_str().unwrap(),"shell":null,"detach":null,"timeout_ms":1500})).unwrap();
+        assert_eq!(result["timed_out"], true);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn write_refuses_existing_file_without_explicit_overwrite() {
         let directory = temporary_directory("overwrite");
         let file = directory.join("note.txt");
@@ -489,6 +789,58 @@ mod tests {
         assert_eq!(result["bytes_read"], 32);
         assert_eq!(result["content"].as_str().unwrap().len(), 32);
         assert_eq!(result["truncated"], true);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn read_file_returns_only_the_requested_numbered_line_ranges() {
+        let directory = temporary_directory("read-ranges");
+        let file = directory.join("f.txt");
+        fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let result = read_file(&json!({"path":file,"max_bytes":null,"ranges":["2-3","5-"]})).unwrap();
+        assert_eq!(result["total_lines"], 5);
+        assert_eq!(result["ranges"][0]["content"], "2| two\n3| three\n");
+        assert_eq!(result["ranges"][1]["content"], "5| five\n");
+        let past = read_file(&json!({"path":file,"ranges":["9-12"]})).unwrap();
+        assert!(past["ranges"][0]["error"].as_str().unwrap().contains("5 lines"));
+        assert!(read_file(&json!({"path":file,"ranges":["0-2"]})).is_err());
+        assert!(read_file(&json!({"path":file,"ranges":["x"]})).is_err());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn edit_file_applies_several_line_ranges_atomically_against_the_original_numbering() {
+        let directory = temporary_directory("edit-lines");
+        let file = directory.join("f.txt");
+        fs::write(&file, "a\nb\nc\nd\ne\nf\n").unwrap();
+        let result = edit_file(&json!({"path":file,"edits":[
+            {"lines":"5-6","replacement":"E\nF\nG\n"},
+            {"lines":"2-3","replacement":"B"},
+            {"lines":"4-3","replacement":"inserted"},
+        ],"find":null,"replace":null})).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "a\nB\ninserted\nd\nE\nF\nG\n");
+        assert_eq!(result["edits_applied"], 3);
+        assert_eq!(result["lines_after"], 7);
+        assert_eq!(result["edits"][2]["now_at"], "5-7");
+        edit_file(&json!({"path":file,"edits":[{"lines":"1","replacement":""}]})).unwrap();
+        assert!(fs::read_to_string(&file).unwrap().starts_with("B\n"));
+        let before = fs::read_to_string(&file).unwrap();
+        assert!(edit_file(&json!({"path":file,"edits":[{"lines":"1-3","replacement":"x"},{"lines":"3-4","replacement":"y"}]})).unwrap_err().contains("overlap"));
+        assert!(edit_file(&json!({"path":file,"edits":[{"lines":"2-99","replacement":"x"}]})).unwrap_err().contains("outside"));
+        assert!(edit_file(&json!({"path":file,"edits":[{"lines":"2-3","replacement":"x"}],"find":"B","replace":"b"})).is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), before, "a rejected edit writes nothing");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn line_edits_keep_crlf_endings_and_a_missing_final_newline() {
+        let directory = temporary_directory("edit-crlf");
+        let file = directory.join("f.txt");
+        fs::write(&file, "a\r\nb\r\nc").unwrap();
+        edit_file(&json!({"path":file,"edits":[{"lines":"2-3","replacement":"x\ny"}]})).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "a\r\nx\r\ny");
+        edit_file(&json!({"path":file,"edits":[{"lines":"2-1","replacement":"mid"}]})).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "a\r\nmid\r\nx\r\ny");
         let _ = fs::remove_dir_all(directory);
     }
 
