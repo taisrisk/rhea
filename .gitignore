@@ -1,0 +1,55 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local secrets and OAuth state
+.env
+.env.*
+!.env.example
+secrets/
+tokens.json
+oauth-token.json
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+/target/
+/target-*/
+/JARVUS.exe
+*.pdb
+*.dSYM/
+*.app/
+*.dmg
+*.msi
+*.zip
+
+# Operating-system and editor artifacts
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local scratch and temporary files
+*.tmp
+*.bak
+*.old
+
+# Local captures and debug output
+captures/
+debug-screens/
+*.log
+
+# Obsidian local workspace state is user-specific; keep the vault itself.
+JARVUS VAULT/.obsidian/workspace.json
+JARVUS VAULT/.obsidian/cache/
+
+# Local-only tooling, planning notes and captures
+*.exe
+captures/
+/.taste-skill/
+/.planning/
+/.cargo/

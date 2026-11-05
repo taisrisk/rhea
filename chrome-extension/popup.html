@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>JARVUS Browser Bridge</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <header>
+      <span id="dot" class="dot"></span>
+      <div>
+        <h1>JARVUS Browser Bridge</h1>
+        <p id="state">Checking…</p>
+      </div>
+    </header>
+    <p class="note">The bridge connects to JARVUS automatically while Chrome is open. JEV can read and operate any of your tabs when you ask it to. Password values and cookies are never read.</p>
+    <p id="error" class="error" hidden></p>
+    <button id="reconnect" type="button">Reconnect</button>
+  </main>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

@@ -1,0 +1,99 @@
+name: macOS build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS x64
+            runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            asset_arch: x64
+          - name: macOS Apple Silicon
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
+            asset_arch: arm64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Agent Desktop
+        run: |
+          npm install --global agent-desktop
+          agent-desktop version
+
+      - name: Test
+        run: cargo test --locked --bin jarvus --target ${{ matrix.rust_target }}
+
+      - name: Build
+        run: cargo build --release --locked --bin jarvus --target ${{ matrix.rust_target }}
+
+      - name: Package executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          stage="dist/JARVUS-v${version}-macos-${{ matrix.asset_arch }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.rust_target }}/release/jarvus" "$stage/jarvus"
+          cp README.md "$stage/README.md"
+          cp assets/jarvus-mark.png "$stage/jarvus-mark.png"
+          chmod +x "$stage/jarvus"
+          tar -C dist -czf "dist/JARVUS-v${version}-macos-${{ matrix.asset_arch }}.tar.gz" "JARVUS-v${version}-macos-${{ matrix.asset_arch }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvus-macos-${{ matrix.asset_arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  attach-release-assets:
+    name: Attach macOS builds to the published release
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: jarvus-macos-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload assets to this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/*.tar.gz --clobber

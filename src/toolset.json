@@ -1,0 +1,809 @@
+[
+  {
+    "type": "function",
+    "name": "list_processes",
+    "description": "List running Windows processes. Use for process inventory, not as proof that an app has a usable UI window.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "jev_run_plan",
+    "description": "Use for local desktop action sequences. JEV runs the bounded steps and returns their results; ChatGPT must inspect those results and continue when the user goal spans multiple actions. A research, search, count, threshold, comparison, or summary task must return to ChatGPT for verification and next steps. Multi-step plans always return to ChatGPT, even if final=true is requested; the app enforces this. Only a single mechanical action with an observable successful result may finish locally. Never treat a plan's completed status alone as proof of a research goal. For web research, use browser search/extract tools, gather the requested number/threshold of sourced results, then summarize only what was observed. Targets are visible labels; JEV resolves them from fresh app state. If a step fails, nothing later runs; use the returned state to continue without repeating completed work. Never resend after message_sent is true.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 25,
+          "items": {
+            "type": "object",
+            "properties": {
+              "do": {
+                "type": "string",
+                "enum": [
+                  "open_app",
+                  "message",
+                  "click",
+                  "double_click",
+                  "right_click",
+                  "move",
+                  "drag",
+                  "hold",
+                  "scroll",
+                  "type",
+                  "send",
+                  "press",
+                  "wait",
+                  "web_open",
+                  "web_tab",
+                  "web_click",
+                  "web_type",
+                  "web_send",
+                  "web_select",
+                  "web_press",
+                  "web_wait",
+                  "web_scroll"
+                ]
+              },
+              "app": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "App name, e.g. Discord. Carries over to later steps."
+              },
+              "target": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Visible label of the control to click or type into"
+              },
+              "recipient": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Conversation name exactly as the user said it (message step)"
+              },
+              "text": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Exact text to type/send, or text to wait for"
+              },
+              "keys": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Key combo for press, e.g. ctrl+k, return, escape"
+              },
+              "within": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Area the target lives in, plain words (e.g. 'servers', 'channels', 'direct messages', 'toolbar', 'search results')."
+              },
+              "x": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Screen x (use only with a point from returned state)."
+              },
+              "y": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Screen y."
+              },
+              "to": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Drag destination label."
+              },
+              "to_x": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Drag destination x."
+              },
+              "to_y": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Drag destination y."
+              },
+              "button": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "left (default), right or middle."
+              },
+              "count": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Clicks (1-3)."
+              },
+              "ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Hold/wait duration in ms."
+              },
+              "amount": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Scroll notches: positive up, negative down."
+              }
+            },
+            "required": [
+              "do",
+              "app",
+              "target",
+              "recipient",
+              "text",
+              "keys",
+              "within",
+              "x",
+              "y",
+              "to",
+              "to_x",
+              "to_y",
+              "button",
+              "count",
+              "ms",
+              "amount"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "done_message": {
+          "type": "string",
+          "description": "Short reply for one successful atomic action only. Keep empty when the plan needs ChatGPT to verify or continue."
+        },
+        "final": {
+          "type": "boolean",
+          "description": "Set true only for one atomic action with an observable successful result. Research, search, count, threshold, comparison, summary, and all multi-step requests are forced false and returned to ChatGPT for supervision."
+        }
+      },
+      "required": [
+        "steps",
+        "done_message",
+        "final"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "open_app",
+    "description": "Open or focus the exact user-named app on this computer. Checks running graphical apps, focuses an existing match, then uses Agent Desktop's native platform launcher and app-discovery paths. Returns a fresh compact app snapshot after launch/focus. Call directly for a user-named app; do not precede it with desktop_list_apps. Never substitutes a browser or another app.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "app": {
+          "type": "string",
+          "description": "Exact app name or executable the user requested."
+        }
+      },
+      "required": [
+        "app"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_list_apps",
+    "description": "List running graphical apps through Agent Desktop when the user requests an app inventory or the target is ambiguous. For a user-named app, call open_app directly; it checks running apps and returns a fresh observation.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_list_windows",
+    "description": "List visible app windows. Set app to null to list all windows. Prefer app-scoped listing after launch when more than one window may exist.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "app": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "app"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_launch",
+    "description": "Open or focus the named app using JEV's exact-app resolver. JEV returns a fresh compact snapshot after launch/focus; use desktop_list_windows only to disambiguate multiple windows.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "app": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "app"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_focus_window",
+    "description": "Focus an observed app window by a current window ID, app name, or title. Supply null for identifiers not used. JEV verifies focus and returns a fresh compact snapshot.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "window_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "app": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "window_id",
+        "app",
+        "title"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_snapshot",
+    "description": "Read a fresh, full Agent Desktop accessibility tree for the selected app/window or focused UI. Defaults: interactive_only=false, compact=false, skeleton=false, filter=all, max_depth=32, timeout_ms=30000. JEV retains the full returned tree locally and returns only a bounded refs/roles/safe-label summary to ChatGPT. If you know a visible target label (for example a DM name), pass target_text so matching refs are prioritized. When target_resolution.status is resolved, use its unique same-snapshot action_ref; when unresolved, do not guess and inspect its reason/candidates. JEV maps a label to a clickable ancestor only when exactly one matching label and one same-snapshot actionable ancestor exist in a complete retained tree. Use a filter or interactive_only only when explicitly useful; these can hide static row labels. Screenshot pixels and editable field values are never included in the model summary.",
+    "strict": false,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "surface": {
+          "type": "string",
+          "enum": [
+            "window",
+            "focused",
+            "menu",
+            "menubar",
+            "sheet",
+            "popover",
+            "alert",
+            "desktop",
+            "taskbar",
+            "system-tray",
+            "quick-settings",
+            "notification-center",
+            "toolbar",
+            "start-menu",
+            "action-center"
+          ],
+          "description": "Choose the smallest surface that contains the requested target."
+        },
+        "app": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "interactive_only": {
+          "type": "boolean",
+          "default": false,
+          "description": "Set true only when control-only discovery is requested; default false preserves row labels and text."
+        },
+        "filter": {
+          "type": "string",
+          "enum": [
+            "all",
+            "buttons",
+            "editables",
+            "links",
+            "checkables",
+            "text",
+            "containers",
+            "other"
+          ],
+          "default": "all",
+          "description": "Optional result filter. Defaults to all."
+        },
+        "target_text": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional visible label to prioritize in the returned ref summary, such as a recipient name already visible in the app."
+        },
+        "compact": {
+          "type": "boolean",
+          "default": false,
+          "description": "Collapse unnamed single-child nodes; default false."
+        },
+        "skeleton": {
+          "type": "boolean",
+          "default": false,
+          "description": "Return a shallow structural skeleton; default false."
+        },
+        "max_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 32,
+          "description": "Maximum tree depth; defaults to 32 to include nested app controls and sidebars."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120000,
+          "default": 30000,
+          "description": "Snapshot deadline; defaults to 30000 ms for complete initial app/window discovery."
+        }
+      },
+      "required": [
+        "surface",
+        "app",
+        "window_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_find",
+    "description": "Find a visible accessibility element by text, name, or role in the selected app/window when the latest snapshot omits the target or leaves it ambiguous. Prefer an existing ref from the latest snapshot to avoid a redundant search. Agent Desktop's Windows editable role is `textfield`; if `edit` finds nothing JEV retries `textfield`. JEV returns a compact result with safe labels and fresh qualified refs, not the raw search tree.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "app": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "app",
+        "window_id",
+        "text",
+        "name",
+        "role"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_get",
+    "description": "Read text, value, title, bounds, role, or states from an element ref in a fresh snapshot. Do not read composer contents during an explicitly authorized send handled by desktop_send; that tool keeps field values local.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "property": {
+          "type": "string",
+          "enum": [
+            "text",
+            "value",
+            "title",
+            "bounds",
+            "role",
+            "states"
+          ]
+        }
+      },
+      "required": [
+        "ref",
+        "property"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_click",
+    "description": "Activate one uniquely identified control from the latest JEV snapshot using Windows UI Automation semantics so the intended control can receive focus without forcing a physical pointer click. JEV checks delivery and returns a fresh compact snapshot of the same app/window. Complete navigation to the intended destination before the send sequence; after desktop_send is called, do not click as a fallback. Use desktop_mouse_click only when a physical coordinate click is specifically needed.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_type",
+    "description": "Type user-provided text into a control identified by a fresh qualified ref only when the user asked for text entry without submission. Supply the snapshot_id returned with that ref. On Windows, JEV uses headed Agent Desktop input so it targets the selected control in the exact app window; JEV checks delivery and returns a fresh compact snapshot without echoing typed content. For an explicitly authorized send use desktop_send; do not call desktop_type, desktop_get, desktop_press, or desktop_click as a fallback after desktop_send, even when its result is unverified.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "snapshot_id": {
+          "type": "string",
+          "description": "snapshot_id returned with the fresh snapshot containing ref."
+        },
+        "ref": {
+          "type": "string",
+          "description": "Qualified ref from the same snapshot_id."
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 2000
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "ref",
+        "text"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_send",
+    "description": "Sole send path for exact user-authorized text. After a fresh observation confirms the intended destination and one unique editable composer, call desktop_send once with that snapshot_id, ref, and exact text. It verifies delivery, then presses Return at most once using the fresh post-type snapshot. If typing is unverified, JEV stops without submitting; if Return is uncertain, use the returned observation to report status and never fall back to desktop_type, desktop_get, desktop_press, desktop_click, or another desktop_send. The private field value is never echoed.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "snapshot_id": {
+          "type": "string"
+        },
+        "ref": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 2000
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "ref",
+        "text"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_press",
+    "description": "Send one allowlisted key to the exact app/window represented by the latest snapshot_id. JEV checks delivery and returns a fresh compact snapshot. Use Return to submit only for a distinct user-authorized submission that is not being handled by desktop_send. Never use desktop_press as a fallback after desktop_send.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "snapshot_id": {
+          "type": "string",
+          "description": "snapshot_id from the latest desktop_snapshot or action result."
+        },
+        "combo": {
+          "type": "string",
+          "enum": [
+            "return",
+            "escape",
+            "tab",
+            "shift+tab",
+            "space",
+            "backspace",
+            "delete",
+            "up",
+            "down",
+            "left",
+            "right",
+            "ctrl+a",
+            "ctrl+c",
+            "ctrl+v",
+            "ctrl+s",
+            "ctrl+w",
+            "ctrl+l",
+            "ctrl+shift+tab",
+            "alt+tab"
+          ]
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "combo"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_mouse_move",
+    "description": "Move the real cursor to an absolute point inside the target window bounds from a fresh snapshot. Requires the current snapshot_id and coordinates within its bounds. JEV returns a fresh compact observation afterward.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "snapshot_id": {
+          "type": "string"
+        },
+        "x": {
+          "type": "integer"
+        },
+        "y": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "x",
+        "y"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_mouse_click",
+    "description": "Physically left-click one absolute point inside the target window bounds from a fresh snapshot. Requires its current snapshot_id and in-window coordinates. JEV checks delivery and returns a fresh compact observation; never repeat an uncertain click without inspecting it.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "snapshot_id": {
+          "type": "string"
+        },
+        "x": {
+          "type": "integer"
+        },
+        "y": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "x",
+        "y"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_hover",
+    "description": "Move the cursor over a control identified by a fresh qualified ref. JEV returns a fresh compact snapshot so hover menus and tooltips can be inspected.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_scroll",
+    "description": "Scroll one observed accessibility element by 1 to 10 units. JEV checks delivery and returns a fresh compact snapshot for the same app/window.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "up",
+            "down",
+            "left",
+            "right"
+          ]
+        },
+        "amount": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ref",
+        "direction",
+        "amount"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_wait",
+    "description": "Wait for text to appear in the same app represented by a fresh snapshot_id, then return a fresh compact observation. Use for asynchronous navigation/loading; timeout is bounded to 120 seconds.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "snapshot_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "timeout_ms": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "text",
+        "timeout_ms"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "desktop_screenshot",
+    "description": "Capture an app screenshot to a local file and return its path. Only use when visual evidence is needed; pixels remain local and are not sent to the model.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "app": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "app",
+        "window_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "mcp_add_servers",
+    "description": "Add or update MCP servers from a config the user pasted or attached (the standard {\"mcpServers\": {\"Name\": {\"command\": ..., \"args\": [...], \"env\": {...}}}} JSON; VS Code \"servers\" and bare maps also work). Pass the JSON text exactly as given. Existing servers that are not in the config are kept and keep running; new or changed servers are saved and connected immediately, so their tools are available from the next message. Returns added/updated/connected/failed.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "config_json": {
+          "type": "string",
+          "maxLength": 200000
+        }
+      },
+      "required": [
+        "config_json"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "list_mcps",
+    "description": "Always-available. Lists every connection with its LIVE health status (connected, disconnected, unauthorized, error, disabled): configured MCP servers, the built-in Chrome browser bridge (id \"chrome\", not an MCP server) and built-in JARVUS Shell. Call it when you need to know which MCPs exist or whether one is usable. The answer_hint field is a plain-language summary; do not omit Chrome when answering which integrations are connected. Secret values are never returned. Chrome and MCP tools are NOT loaded until you call get_tools_.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "get_tools_",
+    "description": "Load the tools of one connected MCP into this conversation, only when you need them. Call it ONCE the first time you will use that MCP, then call its tools directly. server = the id from list_mcps: \"chrome\" for the Chrome browser bridge (browser__tabs, browser__open, browser__click, browser__extract, ...) or the id of a configured MCP server. Returns the tool names; the full schemas become callable on your next step.",
+    "strict": true,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "server": {
+          "type": "string",
+          "description": "Connection id from list_mcps, e.g. chrome"
+        }
+      },
+      "required": [
+        "server"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

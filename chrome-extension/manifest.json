@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "JARVUS Browser Bridge",
+  "version": "0.2.0",
+  "description": "Lets the local JARVUS assistant read and operate your Chrome tabs.",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvLHLq+cUHyeb14WALxaCO9hhNAwdrjiUYUIB3S26rU6cJRE5sf9xsTEL5CeK5ZBw1ETck9SLS2+TX/TtSkHqg/c7eLfgzmxM5v8Tvspw8oWXkE2XmRjx6kU0BI2/2/fj0kODIJZX2uc5hrkGqhuXS7PS7F88HbEaeynkUwKunaFU0aIUMvkIDxjRtMqDzh6Yhg7RVkc/1te5aXMifKHNNXzuipD4EVlX6Vw66eLB1vo9g5GKf1ovTWjgcWn0bntsDH1uu7qs572XkaVnpFD9NQm9L1Gmv1mRUrjWWy2dB1RbavDriQWpm6v/0wbyTQzXJJUAzu6T7Irx2fi7r6UU5QIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "scripting",
+    "tabs",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_title": "JARVUS Browser Bridge",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}
