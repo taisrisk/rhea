@@ -702,6 +702,9 @@ impl JarvusApp {
             let stop_hooks = hooks.clone();
             let stop_chat = chat_id.clone();
             let team_chat = chat_id.clone();
+            let save_chat = chat_id.clone();
+            // The model's own transcript of this chat (messages, tool calls and results, loaded tools).
+            let saved_state = chat_store::load_model_state(&chat_id);
             let inbox_chat = chat_id.clone();
             let last_status = Arc::new(Mutex::new(String::new()));
             let options = chat::RunOptions {
@@ -711,6 +714,8 @@ impl JarvusApp {
                 worker: false,
                 hold_for_team: Some(Box::new(move || tools::hold_for_team(&team_chat))),
                 compact_percent,
+                state: Some(saved_state),
+                on_state: Some(Box::new(move |state| chat_store::save_model_state(&save_chat, &state))),
                 session_id: Some(format!("jarvus-{chat_id}")),
                 inbox: Some(Box::new(move || tools::team_inbox(team::MAIN, &inbox_chat, &last_status))),
                 on_stop: Some(Box::new(move |answer| {
@@ -1521,13 +1526,26 @@ impl JarvusApp {
         }
         let turns = conversation.turns[start..through].to_vec();
         let summary = conversation.context_summary.clone();
+        let chat_id = conversation.id.clone();
+        let visible_turns = conversation.turns.len() - start;
         let session = format!("jarvus-{}", conversation.id);
         let model = self.selected_model.clone();
         self.begin(
             move |tx| {
-                let result = auth::token()
-                    .and_then(|tokens| chat::compact_conversation(&tokens.access_token, tokens.account_id.as_deref(), &model, &summary, Some(&session), &turns))
-                    .map(|summary| (summary, through));
+                let result = auth::token().and_then(|tokens| {
+                    // Prefer the model's own saved transcript (it includes tool calls and results);
+                    // fall back to the text of the turns when it is missing or stale.
+                    let state = chat_store::load_model_state(&chat_id);
+                    if !state.items.is_empty() && state.turns == visible_turns {
+                        let (summary, remaining, summarized) =
+                            chat::compact_items(&tokens.access_token, tokens.account_id.as_deref(), &model, &summary, Some(&session), &state)?;
+                        chat_store::save_model_state(&chat_id, &remaining);
+                        Ok((summary, start + summarized))
+                    } else {
+                        chat::compact_conversation(&tokens.access_token, tokens.account_id.as_deref(), &model, &summary, Some(&session), &turns)
+                            .map(|summary| (summary, through))
+                    }
+                });
                 let _ = tx.send(Ok(CompletedOperation::Compacted(result)));
             },
             "Compacting context…",

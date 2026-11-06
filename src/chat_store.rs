@@ -37,6 +37,34 @@ pub fn captures_dir() -> PathBuf {
     app_data_root().unwrap_or_else(env::temp_dir).join("captures")
 }
 
+/// What the model itself saw in a chat: the Responses API items (user messages, assistant messages,
+/// tool calls and their results), the tool schemas it loaded with `get_tools_`, and where the real
+/// user turns start. The ChatGPT Codex backend does not store conversations (`store:true` is
+/// refused), so continuing a chat means sending this transcript again, exactly as Codex does. It is
+/// kept per chat in `model.json`.
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
+pub struct ModelState {
+    #[serde(default)]
+    pub items: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub loaded_tools: Vec<serde_json::Value>,
+    /// Index in `items` of every real user message (not teammate messages).
+    #[serde(default)]
+    pub turn_starts: Vec<usize>,
+    /// How many transcript turns (user + assistant) these items account for; a mismatch with the
+    /// visible transcript (an edit, a regenerate) makes the state stale and it is rebuilt from the turns.
+    #[serde(default)]
+    pub turns: usize,
+}
+
+pub fn load_model_state(id: &str) -> ModelState {
+    read_chat_file::<ModelState>(id, "model.json").ok().flatten().unwrap_or_default()
+}
+
+pub fn save_model_state(id: &str, state: &ModelState) {
+    let _ = write_chat_file(id, "model.json", state);
+}
+
 pub fn chats_root() -> Option<PathBuf> {
     app_data_root().map(|root| root.join("chats"))
 }
@@ -122,7 +150,7 @@ pub fn save_index(index: &ChatIndex) -> io::Result<()> {
 }
 
 pub fn read_chat_file<T: DeserializeOwned>(id: &str, name: &str) -> io::Result<Option<T>> {
-    if !matches!(name, "metadata.json" | "history.json" | "toolcalls.json") {
+    if !matches!(name, "metadata.json" | "history.json" | "toolcalls.json" | "model.json") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unsupported chat file",

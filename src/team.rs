@@ -156,6 +156,8 @@ struct State {
     ask_answer: Option<Option<Vec<(String, String)>>>,
     plan: Option<PlanRequest>,
     plan_decision: Option<PlanDecision>,
+    /// Each agent's own model transcript (kept out of `Agent` so listing agents stays cheap).
+    model_states: HashMap<String, crate::chat_store::ModelState>,
 }
 
 pub struct Hub {
@@ -419,6 +421,15 @@ impl Hub {
         }
         inbox.push_back(Message { from: from.to_owned(), text: clip(text, MAX_MESSAGE_CHARS) });
         self.bump(&mut state);
+    }
+
+    /// The model transcript an agent continues from (empty for a new agent).
+    pub fn agent_state(&self, id: &str) -> crate::chat_store::ModelState {
+        self.lock().model_states.get(id).cloned().unwrap_or_default()
+    }
+
+    pub fn set_agent_state(&self, id: &str, state: crate::chat_store::ModelState) {
+        self.lock().model_states.insert(id.to_owned(), state);
     }
 
     /// Hand `text` to the manager of `chat_id` from outside the team (the user steering a run).

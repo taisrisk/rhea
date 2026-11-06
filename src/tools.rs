@@ -341,6 +341,11 @@ fn agent_runner(ctx: &ToolContext) -> Runner {
             on_stop: None,
             hold_for_team: None,
             compact_percent: base.compact_percent,
+            state: Some(team::hub().agent_state(&request.agent_id)),
+            on_state: Some(Box::new({
+                let agent_id = request.agent_id.clone();
+                move |state| team::hub().set_agent_state(&agent_id, state)
+            })),
         };
         let outcome = chat::respond_with_options(
             &tokens.access_token,

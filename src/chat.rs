@@ -591,6 +591,11 @@ pub struct RunOptions {
     pub hold_for_team: Option<Box<dyn Fn() -> Vec<String> + Send>>,
     /// Compact the transcript once a request would fill this share of the context window.
     pub compact_percent: u8,
+    /// The model's own saved transcript for this chat/agent (see `ModelState`); when it matches the
+    /// visible turns the run continues from it instead of from the text of past replies.
+    pub state: Option<crate::chat_store::ModelState>,
+    /// Called when a run ends (finished, failed or cancelled) with the transcript to continue from.
+    pub on_state: Option<Box<dyn Fn(crate::chat_store::ModelState) + Send>>,
 }
 
 pub const DEFAULT_COMPACT_PERCENT: u8 = 80;
@@ -650,9 +655,70 @@ pub fn respond_with_options(
     history: &[Turn],
     user_message: &str,
     extra_tools: &[Value],
-    mut execute_tool: impl FnMut(&str, &Value) -> Result<Value, String>,
-    options: RunOptions,
+    execute_tool: impl FnMut(&str, &Value) -> Result<Value, String>,
+    mut options: RunOptions,
     send: impl Fn(StreamEvent),
+) -> Result<String, String> {
+    let on_state = options.on_state.take();
+    let mut run = RunState::default();
+    let result = respond_inner(
+        access_token,
+        account_id,
+        model,
+        reasoning_effort,
+        context_window,
+        prior_summary,
+        history,
+        user_message,
+        extra_tools,
+        execute_tool,
+        options,
+        &send,
+        &mut run,
+    );
+    // Hand the transcript back however the run ended, so a stopped or failed run is still remembered.
+    if run.started {
+        if let Some(save) = on_state {
+            save(run.into_state());
+        }
+    }
+    result
+}
+
+/// What a run builds up that outlives it.
+#[derive(Default)]
+struct RunState {
+    started: bool,
+    input: Vec<Value>,
+    /// Indexes in `input` of the real user messages (the history's and this run's).
+    user_positions: Vec<usize>,
+    loaded_tools: Vec<Value>,
+    /// Transcript turns (user + assistant) this run's items account for.
+    turns: usize,
+}
+
+impl RunState {
+    fn into_state(self) -> crate::chat_store::ModelState {
+        let (items, turn_starts) = persistable_items(&self.input, &self.user_positions);
+        crate::chat_store::ModelState { items, loaded_tools: self.loaded_tools, turn_starts, turns: self.turns }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn respond_inner(
+    access_token: &str,
+    account_id: Option<&str>,
+    model: &str,
+    reasoning_effort: &str,
+    context_window: u64,
+    prior_summary: &str,
+    history: &[Turn],
+    user_message: &str,
+    extra_tools: &[Value],
+    mut execute_tool: impl FnMut(&str, &Value) -> Result<Value, String>,
+    mut options: RunOptions,
+    send: &impl Fn(StreamEvent),
+    run: &mut RunState,
 ) -> Result<String, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -675,41 +741,67 @@ pub fn respond_with_options(
     // enter and submit the requested message.
     let mut tools = tools_for_request(extra_tools, user_message)?;
     let explicit_send_requested = has_explicit_send_intent(user_message);
-    let mut request_history = history.to_vec();
+    // Continue from the model's own saved transcript when it still matches the visible turns;
+    // otherwise (a new chat, an edit, a regenerate) rebuild it from the turns' text and tool digests.
+    let saved = options.state.take().unwrap_or_default();
+    let (mut prior, mut starts) = resume_items(&saved, history);
+    // Tools the model loaded earlier in this chat stay loaded: no `get_tools_` again every run.
+    if let Some(list) = tools.as_array_mut() {
+        for schema in saved.loaded_tools {
+            let name = schema.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+            if !name.is_empty() && !list.iter().any(|tool| tool.get("name").and_then(Value::as_str) == Some(name.as_str())) {
+                list.push(schema.clone());
+            }
+            run.loaded_tools.push(schema);
+        }
+    }
     let mut current_summary = prior_summary.trim().to_owned();
+    let mut history_turns = history.len();
     let window = context_window.max(16_000);
     let estimated = estimate_tokens(system_prompt())
-        + estimate_turns(&request_history)
+        + estimate_items(&prior)
         + estimate_tokens(user_message)
         + estimate_tokens(&current_summary);
     let compact_percent = u64::from(clamp_compact_percent(if options.compact_percent == 0 { DEFAULT_COMPACT_PERCENT } else { options.compact_percent }));
     let compact_limit = window.saturating_mul(compact_percent) / 100;
-    if estimated > compact_limit && request_history.len() > 16 {
-        let summarized_turns = request_history.len() - 12;
-        send(StreamEvent {
-            tool_name: Some("compact_context".to_owned()),
-            ..Default::default()
-        });
-        current_summary = compact_history(
-            access_token,
-            account_id,
-            model,
-            &current_summary,
-            options.session_id.as_deref(),
-            &request_history[..summarized_turns],
-            &http,
-            &send,
-        )?;
-        request_history.drain(..summarized_turns);
-        send(StreamEvent {
-            compaction: Some(CompactionUpdate {
-                summary: current_summary.clone(),
-                summarized_turns,
-            }),
-            ..Default::default()
-        });
+    if estimated > compact_limit {
+        if let Some((cut, summarized_turns)) = compaction_cut(&starts) {
+            send(StreamEvent {
+                tool_name: Some("compact_context".to_owned()),
+                ..Default::default()
+            });
+            current_summary = compact_history(
+                access_token,
+                account_id,
+                model,
+                &current_summary,
+                options.session_id.as_deref(),
+                &items_to_turns(&prior[..cut]),
+                &http,
+                send,
+            )?;
+            prior.drain(..cut);
+            starts = starts.into_iter().filter(|start| *start >= cut).map(|start| start - cut).collect();
+            history_turns = history_turns.saturating_sub(summarized_turns);
+            send(StreamEvent {
+                compaction: Some(CompactionUpdate {
+                    summary: current_summary.clone(),
+                    summarized_turns,
+                }),
+                ..Default::default()
+            });
+        }
     }
-    let mut input = conversation_input(&current_summary, &request_history, user_message);
+    let mut built = base_input(&current_summary);
+    let offset = built.len();
+    run.user_positions = starts.iter().map(|start| start + offset).collect();
+    built.extend(prior);
+    run.user_positions.push(built.len());
+    built.push(json!({"role":"user","content":user_message}));
+    run.input = built;
+    run.turns = history_turns + 2;
+    run.started = true;
+    let input = &mut run.input;
     let mut compose_active = options.compose;
     if compose_active {
         input.push(json!({"role":"developer","content":COMPOSE_PROMPT}));
@@ -764,7 +856,7 @@ pub fn respond_with_options(
             }
         }
         if last_input_tokens > compact_limit {
-            if trim_old_tool_outputs(&mut input, 12) > 0 {
+            if trim_old_tool_outputs(input, 12) > 0 {
                 last_input_tokens = 0;
             }
         }
@@ -1213,6 +1305,7 @@ pub fn respond_with_options(
             for schema in newly_loaded_tools {
                 let name = schema.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
                 if !name.is_empty() && !available.iter().any(|tool| tool.get("name").and_then(Value::as_str) == Some(name.as_str())) {
+                    run.loaded_tools.push(schema.clone());
                     available.push(schema);
                 }
             }
@@ -2077,7 +2170,19 @@ fn compact_history(
     Ok(summary.trim().to_owned())
 }
 
-fn conversation_input(summary: &str, history: &[Turn], user_message: &str) -> Vec<Value> {
+/// The items a run continues from: the saved model transcript when it still accounts for exactly
+/// the visible turns, otherwise the turns' own text (with tool digests). Also where each real user
+/// message sits in those items.
+fn resume_items(saved: &crate::chat_store::ModelState, history: &[Turn]) -> (Vec<Value>, Vec<usize>) {
+    if !saved.items.is_empty() && saved.turns == history.len() {
+        return (saved.items.clone(), saved.turn_starts.clone());
+    }
+    let starts = history.iter().enumerate().filter(|(_, turn)| turn.role == "user").map(|(index, _)| index).collect();
+    (turn_items(history), starts)
+}
+
+/// The developer messages every request starts with.
+fn base_input(summary: &str) -> Vec<Value> {
     let mut input = vec![
         json!({"role":"developer","content":system_prompt()}),
         json!({"role":"developer","content":"ChatGPT plans; JEV tools execute. Use fresh Agent Desktop observations before every state-changing step."}),
@@ -2085,13 +2190,153 @@ fn conversation_input(summary: &str, history: &[Turn], user_message: &str) -> Ve
     if !summary.trim().is_empty() {
         input.push(json!({"role":"developer","content":format!("Earlier conversation summary (the full local transcript is preserved):\n{}", summary.trim())}));
     }
-    input.extend(
-        history
-            .iter()
-            .map(|turn| json!({"role":turn.role,"content":turn_model_text(turn)})),
-    );
+    input
+}
+
+/// A transcript's turns as plain messages (assistant turns carry their tool digest).
+fn turn_items(history: &[Turn]) -> Vec<Value> {
+    history.iter().map(|turn| json!({"role":turn.role,"content":turn_model_text(turn)})).collect()
+}
+
+#[cfg(test)]
+fn conversation_input(summary: &str, history: &[Turn], user_message: &str) -> Vec<Value> {
+    let mut input = base_input(summary);
+    input.extend(turn_items(history));
     input.push(json!({"role":"user","content":user_message}));
     input
+}
+
+fn item_chars(item: &Value) -> usize {
+    item.to_string().len()
+}
+
+fn estimate_items(items: &[Value]) -> u64 {
+    items.iter().map(|item| (item_chars(item) as u64).saturating_add(3) / 4 + 4).sum()
+}
+
+/// Where to cut the oldest turns off for compaction: keep the last two turns, summarize everything
+/// before the one that starts the pair. Returns (item index to cut at, turns summarized).
+fn compaction_cut(starts: &[usize]) -> Option<(usize, usize)> {
+    if starts.len() < 4 {
+        return None;
+    }
+    let keep_from = starts.len() - 2;
+    Some((starts[keep_from], keep_from * 2))
+}
+
+fn clip_text(text: &str, max: usize) -> String {
+    let mut out: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+/// Plain text of a message item's content (a string, or a list of text parts).
+fn message_text(item: &Value) -> String {
+    match item.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts.iter().filter_map(|part| part.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Items as readable turns for the summarizer.
+fn items_to_turns(items: &[Value]) -> Vec<Turn> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let (role, content) = match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => (
+                    "assistant",
+                    format!(
+                        "[called tool {} with {}]",
+                        item.get("name").and_then(Value::as_str).unwrap_or("?"),
+                        clip_text(item.get("arguments").and_then(Value::as_str).unwrap_or(""), 300)
+                    ),
+                ),
+                Some("function_call_output") => ("user", format!("[tool result] {}", clip_text(item.get("output").and_then(Value::as_str).unwrap_or(""), 1_500))),
+                Some("message") => ("assistant", message_text(item)),
+                _ => match item.get("role").and_then(Value::as_str) {
+                    Some(role @ ("user" | "assistant")) => (role, message_text(item)),
+                    _ => return None,
+                },
+            };
+            Some(Turn { role: role.into(), content, ..Default::default() })
+        })
+        .collect()
+}
+
+/// The part of a run's input worth keeping for the next run: messages, tool calls and their results.
+/// Developer notes (rebuilt every run) and reasoning items (not needed to continue) are dropped, a
+/// call without its result (or a result without its call) is dropped so the next request is valid,
+/// and very long tool output is capped. Returns the items and the new indexes of the real user messages.
+fn persistable_items(input: &[Value], user_positions: &[usize]) -> (Vec<Value>, Vec<usize>) {
+    const MAX_OUTPUT_CHARS: usize = 24_000;
+    let mut kept: Vec<(usize, Value)> = Vec::new();
+    for (index, item) in input.iter().enumerate() {
+        let keep = match item.get("type").and_then(Value::as_str) {
+            Some("function_call") | Some("function_call_output") | Some("message") => true,
+            None => matches!(item.get("role").and_then(Value::as_str), Some("user" | "assistant")),
+            Some(_) => false,
+        };
+        if keep {
+            kept.push((index, item.clone()));
+        }
+    }
+    let calls: std::collections::HashSet<String> = kept
+        .iter()
+        .filter(|(_, item)| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .filter_map(|(_, item)| item.get("call_id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    let outputs: std::collections::HashSet<String> = kept
+        .iter()
+        .filter(|(_, item)| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .filter_map(|(_, item)| item.get("call_id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    kept.retain(|(_, item)| match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => item.get("call_id").and_then(Value::as_str).is_some_and(|id| outputs.contains(id)),
+        Some("function_call_output") => item.get("call_id").and_then(Value::as_str).is_some_and(|id| calls.contains(id)),
+        _ => true,
+    });
+    let mut items = Vec::with_capacity(kept.len());
+    let mut starts = Vec::new();
+    for (original, mut item) in kept {
+        if user_positions.contains(&original) {
+            starts.push(items.len());
+        }
+        if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+            if let Some(output) = item.get("output").and_then(Value::as_str) {
+                if output.chars().count() > MAX_OUTPUT_CHARS {
+                    item["output"] = json!(format!("{}\n…[output capped at {MAX_OUTPUT_CHARS} characters]", output.chars().take(MAX_OUTPUT_CHARS).collect::<String>()));
+                }
+            }
+        }
+        items.push(item);
+    }
+    (items, starts)
+}
+
+/// Summarize the oldest part of a chat's saved transcript on demand (`/compact`). Returns the new
+/// summary, the items that remain, their turn starts, and how many turns were summarized.
+pub fn compact_items(
+    access_token: &str,
+    account_id: Option<&str>,
+    model: &str,
+    prior_summary: &str,
+    session_id: Option<&str>,
+    state: &crate::chat_store::ModelState,
+) -> Result<(String, crate::chat_store::ModelState, usize), String> {
+    let (cut, summarized_turns) = compaction_cut(&state.turn_starts).ok_or("Nothing to compact yet.")?;
+    let http = Client::builder().timeout(Duration::from_secs(180)).build().map_err(|e| e.to_string())?;
+    let summary = compact_history(access_token, account_id, model, prior_summary, session_id, &items_to_turns(&state.items[..cut]), &http, &|_| {})?;
+    let remaining = crate::chat_store::ModelState {
+        items: state.items[cut..].to_vec(),
+        loaded_tools: state.loaded_tools.clone(),
+        turn_starts: state.turn_starts.iter().filter(|start| **start >= cut).map(|start| start - cut).collect(),
+        turns: state.turns.saturating_sub(summarized_turns),
+    };
+    Ok((summary, remaining, summarized_turns))
 }
 
 fn estimate_tokens(text: &str) -> u64 {
@@ -3090,6 +3335,131 @@ mod tests {
         big.tool_activity = (0..500).map(|i| ToolActivity { id: i.to_string(), name: "t".into(), result_detail: "r".repeat(5_000), state: "complete".into(), ..Default::default() }).collect();
         assert!(turn_model_text(&big).len() < 18_000 + 400);
         assert!(turn_model_text(&big).contains("earlier calls omitted"));
+    }
+
+    fn call(id: &str, name: &str) -> Value {
+        json!({"type":"function_call","id":format!("fc_{id}"),"call_id":id,"name":name,"arguments":"{}"})
+    }
+
+    fn output(id: &str, text: &str) -> Value {
+        json!({"type":"function_call_output","call_id":id,"output":text})
+    }
+
+    #[test]
+    fn a_runs_transcript_is_kept_without_developer_notes_or_reasoning_and_with_valid_pairs() {
+        let input = vec![
+            json!({"role":"developer","content":"system"}),
+            json!({"role":"user","content":"first"}),
+            json!({"type":"reasoning","id":"rs_1","summary":[]}),
+            call("a", "get_tools_"),
+            output("a", "loaded"),
+            json!({"role":"developer","content":"hook note"}),
+            call("orphan", "run_command"),
+            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}),
+            json!({"role":"user","content":"[message from Lines] teammate"}),
+            json!({"role":"user","content":"second"}),
+            output("ghost", "result without a call"),
+            output("b", &"x".repeat(30_000)),
+            call("b", "read_file"),
+        ];
+        // positions of the real user messages in `input`: 1 and 9
+        let (items, starts) = persistable_items(&input, &[1, 9]);
+        let kinds: Vec<String> = items.iter().map(|i| i.get("type").and_then(Value::as_str).unwrap_or("user/assistant").to_owned()).collect();
+        assert_eq!(kinds, ["user/assistant", "function_call", "function_call_output", "message", "user/assistant", "user/assistant", "function_call_output", "function_call"]);
+        assert_eq!(starts, [0, 5], "real user messages keep their place; the teammate message is not a turn start");
+        let capped = items.iter().find(|i| i["call_id"] == "b" && i["type"] == "function_call_output").unwrap();
+        assert!(capped["output"].as_str().unwrap().chars().count() < 24_100 && capped["output"].as_str().unwrap().contains("capped"));
+        assert!(items.iter().all(|i| i["call_id"] != "orphan" && i["call_id"] != "ghost"));
+    }
+
+    #[test]
+    fn a_chat_continues_from_its_saved_transcript_only_while_it_matches_the_visible_turns() {
+        let turn = |role: &str, text: &str| Turn { role: role.into(), content: text.into(), ..Default::default() };
+        let history = vec![turn("user", "hi"), turn("assistant", "hello")];
+        let state = crate::chat_store::ModelState {
+            items: vec![json!({"role":"user","content":"hi"}), call("a", "get_tools_"), output("a", "ok"), json!({"role":"assistant","content":"hello"})],
+            loaded_tools: vec![],
+            turn_starts: vec![0],
+            turns: 2,
+        };
+        let (items, starts) = resume_items(&state, &history);
+        assert_eq!((items.len(), starts.as_slice()), (4, &[0usize][..]), "the saved transcript, tool calls included, is used");
+        // an edit or regenerate changes the number of visible turns: rebuild from the turns instead
+        let (items, starts) = resume_items(&state, &history[..1]);
+        assert_eq!((items.len(), starts.as_slice()), (1, &[0usize][..]));
+        let (items, _) = resume_items(&crate::chat_store::ModelState::default(), &history);
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn compaction_summarizes_everything_before_the_last_two_turns() {
+        assert_eq!(compaction_cut(&[0, 5, 9]), None, "too short to be worth it");
+        assert_eq!(compaction_cut(&[0, 5, 9, 14]), Some((9, 4)));
+        assert_eq!(compaction_cut(&[0, 5, 9, 14, 20, 30]), Some((20, 8)));
+        let turns = items_to_turns(&[json!({"role":"user","content":"do it"}), call("a", "run_command"), output("a", "42"), json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}), json!({"type":"reasoning"})]);
+        assert_eq!(turns.len(), 4);
+        assert!(turns[1].content.contains("run_command") && turns[2].content.contains("42") && turns[3].content == "done");
+    }
+
+    /// Live check (needs a signed-in session): a second run must continue from the first run's tool
+    /// calls and results, replayed to the Codex backend with `store:false`. Run with:
+    /// cargo test --bin jarvus live_second_run_remembers_the_first_runs_tool_calls -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_second_run_remembers_the_first_runs_tool_calls() {
+        use std::sync::{Arc, Mutex};
+        let tokens = crate::auth::token().expect("sign in first");
+        let models = models(&tokens.access_token, tokens.account_id.as_deref()).unwrap();
+        let model = models.first().unwrap().slug.clone();
+        let saved: Arc<Mutex<Option<crate::chat_store::ModelState>>> = Arc::new(Mutex::new(None));
+        let run = |history: &[Turn], user: &str, state: Option<crate::chat_store::ModelState>| -> (String, Vec<String>) {
+            let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = Arc::clone(&calls);
+            let sink = Arc::clone(&saved);
+            let options = RunOptions {
+                session_id: Some("jarvus-live-probe".into()),
+                state,
+                on_state: Some(Box::new(move |state| *sink.lock().unwrap() = Some(state))),
+                ..Default::default()
+            };
+            let answer = respond_with_options(
+                &tokens.access_token,
+                tokens.account_id.as_deref(),
+                &model,
+                "low",
+                200_000,
+                "",
+                history,
+                user,
+                &[],
+                move |name, _args| {
+                    seen.lock().unwrap().push(name.to_owned());
+                    Ok(json!({"ok": true, "result": {"answer_hint": "Configured MCP servers: none. Marker ALPHA-4471."}}))
+                },
+                options,
+                |_| {},
+            )
+            .expect("run failed");
+            let names = calls.lock().unwrap().clone();
+            (answer, names)
+        };
+        let (first, first_calls) = run(&[], "Call the list_mcps tool exactly once, then reply with only the word DONE.", None);
+        println!("run 1: {first:?} calls={first_calls:?}");
+        assert!(first_calls.iter().any(|name| name == "list_mcps"));
+        let state = saved.lock().unwrap().clone().expect("state saved");
+        assert!(state.items.iter().any(|item| item["type"] == "function_call"), "tool call kept");
+        assert_eq!((state.turns, state.turn_starts.len()), (2, 1));
+        let history = vec![
+            Turn { role: "user".into(), content: "Call the list_mcps tool exactly once, then reply with only the word DONE.".into(), ..Default::default() },
+            Turn { role: "assistant".into(), content: first, ..Default::default() },
+        ];
+        let (second, second_calls) = run(&history, "Without calling any tool: which tool did you call in your previous reply, and what marker text did it return? Answer in one short line.", Some(state));
+        println!("run 2: {second:?} calls={second_calls:?}");
+        assert!(second_calls.is_empty(), "no tool needed to answer: {second_calls:?}");
+        assert!(second.contains("list_mcps"), "{second}");
+        assert!(second.contains("ALPHA-4471"), "the previous tool result must be in context: {second}");
+        let after = saved.lock().unwrap().clone().unwrap();
+        assert_eq!((after.turns, after.turn_starts.len()), (4, 2));
     }
 
     #[test]
