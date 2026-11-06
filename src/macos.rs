@@ -244,6 +244,42 @@ pub fn type_text(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ---- environment ------------------------------------------------------------------------
+
+/// `existing` followed by every entry of `extra` it does not already contain, in order.
+fn merge_paths(existing: &str, extra: &[String]) -> String {
+    let mut parts: Vec<String> = existing.split(':').filter(|p| !p.is_empty()).map(str::to_owned).collect();
+    for entry in extra {
+        if !entry.is_empty() && !parts.iter().any(|p| p == entry) {
+            parts.push(entry.clone());
+        }
+    }
+    parts.join(":")
+}
+
+/// Add the PATH of a login shell and the usual tool folders (Homebrew on both architectures,
+/// npm, cargo) to this process's PATH, so child processes find `node`, `npx`, `brew`, `git`...
+pub fn extend_path() {
+    let mut extra: Vec<String> = Vec::new();
+    if let Ok(output) = Command::new("/bin/zsh").args(["-lc", "printf %s \"$PATH\""]).stdin(Stdio::null()).stderr(Stdio::null()).output() {
+        if output.status.success() {
+            extra.extend(String::from_utf8_lossy(&output.stdout).split(':').map(str::to_owned));
+        }
+    }
+    for fixed in ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin"] {
+        extra.push(fixed.to_owned());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy().into_owned();
+        for relative in [".cargo/bin", ".npm-global/bin", ".volta/bin", ".local/bin", "n/bin"] {
+            extra.push(format!("{home}/{relative}"));
+        }
+    }
+    let merged = merge_paths(&std::env::var("PATH").unwrap_or_default(), &extra);
+    // SAFETY: called once at startup, before any other thread exists.
+    unsafe { std::env::set_var("PATH", merged) };
+}
+
 // ---- apps and windows (System Events) ---------------------------------------------------
 
 /// Run AppleScript lines with arguments passed safely through `argv` (never spliced into the script).
@@ -351,6 +387,13 @@ mod tests {
         assert!(parse_combo("cmd+").is_err());
         assert!(parse_combo("a+b").is_err());
         assert!(parse_combo("cmd+nonsense").is_err());
+    }
+
+    #[test]
+    fn merged_paths_keep_order_and_drop_duplicates() {
+        let merged = merge_paths("/usr/bin:/bin", &["/opt/homebrew/bin".into(), "/usr/bin".into(), String::new(), "/usr/local/bin".into()]);
+        assert_eq!(merged, "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin");
+        assert_eq!(merge_paths("", &["/a".into()]), "/a");
     }
 
     #[test]

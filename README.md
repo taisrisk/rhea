@@ -1,8 +1,8 @@
 # JARVUS
 
-JARVUS is a native desktop assistant for Windows, with macOS support in progress. **JEV** is its local executor: it observes app controls, carries out bounded actions, and returns fresh results. The connected ChatGPT model plans the work, reviews those results, and decides what to do next.
+JARVUS is a native desktop assistant for Windows and macOS. **JEV** is its local executor: it observes app controls, carries out bounded actions, and returns fresh results. The connected ChatGPT model plans the work, reviews those results, and decides what to do next.
 
-> Project status: active development. macOS support is being implemented and is not yet verified end to end. macOS builds are experimental until they pass an interactive runtime check on a Mac.
+> Project status: active development. Windows is the primary, tested platform. The macOS build compiles, passes the unit tests and is packaged by GitHub Actions on real Macs, but its pointer, keyboard and accessibility actions have not had an interactive run on a Mac yet; treat it as a beta.
 
 <p align="center"><img src="assets/jarvus-icon-1024.png" alt="JARVUS icon" width="96"></p>
 
@@ -26,6 +26,14 @@ Desktop automation is permissioned by the operating system. On macOS, JARVUS req
 ## Core skills, Shell and sessions
 
 JEV always follows two built-in skills adapted from [obra/superpowers](https://github.com/obra/superpowers) (MIT): **systematic debugging** (root cause before any fix) and **brainstorming** (understand what the user wants before building). The Shell package's `run_command` runs anything a terminal can (PowerShell, cmd, bash, zsh; up to 15 minutes; `detach` for servers and installers), and a `jev_run_plan` can mix `shell` steps with GUI steps so "install it, open it, click through it" is a single plan. Every chat has a stable session id that keys the ChatGPT prompt cache (the Codex backend does not store conversations server-side, so the full local history is always sent), and the first message also starts a background naming agent that renames the chat with the selected model at its lowest reasoning effort.
+
+## Skills
+
+A skill is a folder with a `SKILL.md` (a name, a description, then instructions and optional helper files). JEV sees the list of installed skills on every run, loads one with `use_skill` when a request matches, and can install more from GitHub with `install_skill`. Type `/` in the chat box for the command menu: `/compact`, `/compose`, `/new`, every installed skill and every MCP server.
+
+- JARVUS reads skills from **`~/.agents/skills`** (shared with your other agent tools) and **`~/.claude/skills`**, and has its own folder, **`~/.jarvus/skills`**, where every new install goes.
+- Two skills ship preinstalled and are downloaded from GitHub on first launch: **design-taste-frontend** ([taste-skill](https://github.com/Leonxlnx/taste-skill), MIT) and **unslop** ([heydamir/unslop](https://github.com/heydamir/unslop), CC BY 4.0, by Damir Sokolovsky). Remove one in Settings and it stays removed.
+- Install your own in Settings > Agents, skills & hooks, or ask JEV: "install https://github.com/owner/repo/tree/main/skills/name".
 
 ## Compose mode, subagents and hooks
 
@@ -66,20 +74,14 @@ npm install --global agent-desktop
 agent-desktop version
 ```
 
-### macOS support in progress
+### macOS
 
-- macOS 13 or newer (Intel or Apple Silicon)
-- Xcode Command Line Tools (`xcode-select --install`)
-- Rust stable toolchain with Cargo
-- Node.js 18 or newer and Agent Desktop:
+- macOS 13 or newer, Intel or Apple Silicon.
+- **Using a release:** download `JARVUS-v<version>-macos-arm64.dmg` (Apple Silicon) or `-x64.dmg` (Intel) from the GitHub Release, drag **JARVUS** to Applications, and the first time right-click it and choose **Open** (the build is ad hoc signed unless the maintainer supplied a Developer ID certificate). The accessibility engine (Agent Desktop) is bundled inside the app; no Node.js is needed.
+- **Permissions:** macOS asks for them one at a time. Switch JARVUS on under System Settings > Privacy & Security > **Accessibility** (required for clicking, typing and key presses) and **Screen Recording** (only for screenshots). Without Accessibility, macOS drops synthetic input silently; JARVUS checks and tells the model which pane to open. An ad hoc signed update is a new app identity to macOS, so the Accessibility switch may need to be turned off and on again after updating.
+- **From source:** Xcode Command Line Tools (`xcode-select --install`), Rust, and for development Node.js 18+ with `npm install --global agent-desktop` (or the bundled copy when running from an `.app`).
 
-```sh
-npm install --global agent-desktop
-agent-desktop status
-agent-desktop permissions --guide
-```
-
-Agent Desktop uses macOS Accessibility APIs. Grant Accessibility access to the process that launches JARVUS when prompted. Grant Screen Recording only if using screenshot capture. macOS builds are experimental until a Mac runtime pass verifies launch, permissions, browser connection, and desktop actions.
+How it works on a Mac: pointer, scroll and keyboard actions are posted natively as CoreGraphics events; the front app and window are read through System Events; apps are launched with `open -a`; reading another app's accessibility tree and acting on its controls goes through Agent Desktop, which wraps the macOS Accessibility (AX) API. The shell tool defaults to `/bin/zsh -lc`, and JEV uses a macOS edition of its operating manual (`src/system_prompt_macos.md`) with Homebrew, `open`, `osascript`, `defaults`, `launchctl`, `pbcopy` and Cmd-based shortcut examples.
 
 ## Build and run
 
@@ -95,13 +97,13 @@ Build an optimized Windows executable on Windows:
 cargo build --release --locked --bin jarvus
 ```
 
-The executable is `target/release/jarvus.exe`. An experimental native macOS binary can be built on a Mac:
+The executable is `target/release/jarvus.exe`. On a Mac, the same command builds the macOS binary, and `packaging/macos/package.sh aarch64-apple-darwin arm64` (or `x86_64-apple-darwin x64`) turns it into `JARVUS.app`, a `.zip` and a `.dmg` under `dist/`:
 
 ```sh
 cargo build --release --locked --bin jarvus
 ```
 
-GitHub Actions builds macOS x64 and Apple Silicon artifacts on macOS runners. The workflow is a build pipeline; successful compilation does not replace interactive macOS accessibility and permission verification.
+GitHub Actions builds, tests and packages both macOS architectures on macOS runners. A green run proves the code compiles and the tests pass on a Mac; it does not replace an interactive accessibility and permission check.
 
 ## Sign in
 
@@ -134,21 +136,16 @@ The built-in Chrome extension is a **browser bridge**, not an MCP server. The bu
 
 ## GitHub builds and releases
 
-The macOS workflow runs on pushes, pull requests, and manual dispatch. It creates separate macOS x64 and Apple Silicon executable archives; a published GitHub Release also receives the matching archives. These are unsigned executable archives, not a signed or notarized `.app` installer.
+The Windows build is made on a PC and uploaded by hand; the macOS builds come from GitHub Actions and are attached to the same release automatically.
 
-Build and stage the Windows executable locally:
+1. Build and stage the Windows executable locally: `.\scripts\release.ps1 -Bump patch`
+2. Review, commit, push and tag that version (`git tag v0.1.1 && git push origin v0.1.1`).
+3. Create the GitHub Release for the tag (on github.com, or `gh release create v0.1.1 --generate-notes`). Publishing it starts **macOS build**, which tests and packages `JARVUS-v<version>-macos-arm64` and `-x64` as `.dmg` and `.zip` and uploads them to the release.
+4. Upload the Windows executable: `.\scripts\release.ps1 -Upload` (needs GitHub CLI authentication, the `origin` remote and the matching tag; it never pushes source).
 
-```powershell
-.\scripts\release.ps1 -Bump patch
-```
+The macOS workflow also runs on every push and pull request (build, test, package; the files are kept as workflow artifacts for 14 days) and can be started by hand from the Actions tab; entering an existing release tag there attaches the builds to that release.
 
-After reviewing, committing, and tagging that version, upload the Windows executable to an existing GitHub Release:
-
-```powershell
-.\scripts\release.ps1 -Upload
-```
-
-The upload option requires GitHub CLI authentication, a configured `origin`, a matching version tag, and an existing release. It never pushes source changes. A repository remote must be configured before uploads can work.
+For a Developer ID signed and notarized macOS build, add these repository secrets and the same workflow signs and notarizes the `.dmg`: `MACOS_CERTIFICATE` (base64 `.p12`), `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`. Without them the app is ad hoc signed.
 
 ## Project map
 
@@ -161,7 +158,10 @@ The upload option requires GitHub CLI authentication, a configured `origin`, a m
 | `src/mcp.rs` | MCP configuration, server connections and tool dispatch |
 | `src/browser.rs` | Chrome extension bridge |
 | `src/chat_store.rs` | Per-chat files, migration and persistence helpers |
-| `src/system_prompt.md` | JEV operating rules and workflow examples |
+| `src/system_prompt.md`, `src/system_prompt_macos.md` | JEV operating manual (Windows-first edition and the macOS edition) |
+| `src/macos.rs` | Native macOS input, window and permission layer |
+| `src/skills.rs` | Skills: discovery, `use_skill`, GitHub install, bundled skills |
+| `packaging/macos/` | `.app` bundle, icon, signing and `.dmg` packaging |
 | `src/toolset.json` | Model-facing function schemas |
 | `chrome-extension/` | Browser extension and native messaging manifest |
 | `JARVUS VAULT/` | Obsidian project notes |
@@ -169,7 +169,7 @@ The upload option requires GitHub CLI authentication, a configured `origin`, a m
 
 ## Current limits
 
-- macOS releases need an interactive Mac verification pass for permissions, app launch, browser connection, and desktop actions.
+- The macOS build has not had an interactive run on a Mac: permissions, app launch, browser connection, and desktop actions still need that check. The accessibility tree and element actions depend on Agent Desktop's AX support for the target app.
 - Agent Desktop can only act on controls its accessibility provider exposes. When a target is missing or ambiguous, JEV should stop and report the limitation instead of guessing.
 - A successful build does not prove that a ChatGPT account, MCP server, browser extension, or third-party desktop action works end to end.
 

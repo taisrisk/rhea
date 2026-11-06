@@ -30,6 +30,10 @@ fn main() {
         }
         return;
     }
+    // An app opened from Finder gets a bare PATH; give child processes (MCP servers, Agent
+    // Desktop, the shell tool's helpers) the PATH a Terminal would have.
+    #[cfg(target_os = "macos")]
+    macos::extend_path();
     if let Err(error) = run_gui() {
         show_startup_error(&error.to_string());
     }
