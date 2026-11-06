@@ -56,8 +56,12 @@ switch ($Bump) {
 $version = "$($parts[0]).$($parts[1]).$($parts[2])"
 $tag = "v$version"
 if (-not $NoPush) {
-    & git rev-parse -q --verify "refs/tags/$tag" 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) { throw "The tag $tag already exists. Pick a larger -Bump or delete the tag." }
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & git rev-parse -q --verify "refs/tags/$tag" *> $null
+    $tagExists = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $previous
+    if ($tagExists) { throw "The tag $tag already exists. Pick a larger -Bump or delete the tag." }
 }
 $utf8 = [Text.UTF8Encoding]::new($false)
 [IO.File]::WriteAllText($manifestPath, $manifest.Remove($match.Index, $match.Length).Insert($match.Index, "version = `"$version`""), $utf8)
@@ -91,12 +95,19 @@ $branch = (& git rev-parse --abbrev-ref HEAD).Trim()
 Invoke-Checked "git" @("push", "origin", $branch)
 Invoke-Checked "git" @("push", "origin", $tag)   # starts the macOS build on GitHub
 
-& gh release view $tag 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    & gh release create $tag --title "Rhea $tag" --generate-notes 2>$null | Out-Null
+# gh prints "release not found" on stderr; Windows PowerShell would turn that into a terminating
+# error under "Stop", so these probing calls run with errors set aside and the exit code is read.
+function Test-Release {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & gh release view $tag *> $null; return ($LASTEXITCODE -eq 0) } finally { $ErrorActionPreference = $previous }
+}
+if (-not (Test-Release)) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & gh release create $tag --title "Rhea $tag" --generate-notes *> $null } finally { $ErrorActionPreference = $previous }
     # the macOS workflow may have created it a moment earlier
-    & gh release view $tag 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Could not create the release $tag." }
+    if (-not (Test-Release)) { throw "Could not create the release $tag." }
 }
 Invoke-Checked "gh" @("release", "upload", $tag, $asset, "--clobber")
 Write-Host "Published $tag with the Windows installer. The macOS files are added by GitHub Actions when its build finishes." -ForegroundColor Green
