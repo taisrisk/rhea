@@ -1,6 +1,6 @@
 //! Installing and updating Rhea itself.
 //!
-//! On Windows the downloaded `Rhea-vX.Y.Z-windows-x64.exe` is its own installer: started from
+//! On Windows the downloaded `Rhea-Setup-vX.Y.Z-windows-x64.exe` is its own installer: started from
 //! anywhere except the install folder it copies itself to `%LOCALAPPDATA%\Programs\Rhea`, replaces
 //! the old copy (stopping it first), adds a Start-menu shortcut and an uninstall entry, then
 //! starts the installed copy and exits. Chats, settings and credentials stay in `~/.rhea` and

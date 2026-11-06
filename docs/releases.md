@@ -13,7 +13,7 @@ The Windows build is made on a PC; the macOS builds come from GitHub Actions and
 It needs git, cargo and the GitHub CLI signed in (`gh auth login`). In order it:
 
 1. bumps the version in `Cargo.toml` and `Cargo.lock` (every build gets a new version),
-2. builds `target\release\rhea.exe` and copies it to `dist\Rhea-vX.Y.Z-windows-x64.exe`,
+2. builds `target\release\rhea.exe` and copies it to `dist\Rhea-Setup-vX.Y.Z-windows-x64.exe`,
 3. commits everything as "Release vX.Y.Z", tags `vX.Y.Z` and pushes the commit and the tag,
 4. creates the GitHub release (or reuses it) and uploads the exe.
 

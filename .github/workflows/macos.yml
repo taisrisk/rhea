@@ -18,11 +18,14 @@ on:
         description: "Existing release tag to attach the macOS builds to (leave empty to only build)"
         required: false
         type: string
-  release:
-    types: [published]
 
 permissions:
   contents: read
+
+# A push of main and of its tag are the same commit: one build per ref, newer pushes replace older ones.
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -96,7 +99,6 @@ jobs:
     needs: build
     if: >-
       (github.event_name == 'push' && github.ref_type == 'tag') ||
-      (github.event_name == 'release' && github.event.action == 'published') ||
       (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-latest
     permissions:
@@ -113,7 +115,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           ls -l dist
           # build.ps1 normally creates the release; make one if the Mac builds finished first.

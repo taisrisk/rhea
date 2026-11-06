@@ -22,7 +22,7 @@ Everything in more depth is in [docs](docs/README.md): [skills](docs/skills.md),
 
 ## Build and run
 
-Get a release: download `Rhea-v<version>-windows-x64.exe` from the [Releases](https://github.com/taisrisk/rhea/releases) page and run it. It installs itself to `%LOCALAPPDATA%\Programs\Rhea`, replacing an older install, and your chats and settings stay in `~/.rhea`. On a Mac download the `.dmg` for your chip. Details: [installing and updating](docs/installer.md).
+Get a release: download `Rhea-Setup-v<version>-windows-x64.exe` from the [Releases](https://github.com/taisrisk/rhea/releases) page and run it. It installs itself to `%LOCALAPPDATA%\Programs\Rhea`, replacing an older install, and your chats and settings stay in `~/.rhea`. On a Mac download the `.dmg` for your chip. Details: [installing and updating](docs/installer.md).
 
 From source, in the repository root:
 

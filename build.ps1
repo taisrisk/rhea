@@ -6,7 +6,7 @@
   1. bumps the version in Cargo.toml / Cargo.lock (patch by default; every build is a new version),
   2. builds the release exe,
   3. commits everything with the message "Release vX.Y.Z", tags it and pushes the commit and tag,
-  4. creates (or reuses) the GitHub release vX.Y.Z and uploads dist\Rhea-vX.Y.Z-windows-x64.exe.
+  4. creates (or reuses) the GitHub release vX.Y.Z and uploads dist\Rhea-Setup-vX.Y.Z-windows-x64.exe.
 
   Pushing the tag also starts the "macOS build" workflow on GitHub, which builds both Mac versions
   and attaches the .dmg/.zip files to the same release. The exe you upload is the installer: when it
@@ -80,7 +80,7 @@ $built = Join-Path $targetRoot "release\rhea.exe"
 if (-not (Test-Path -LiteralPath $built -PathType Leaf)) { throw "Build finished but $built does not exist." }
 $dist = Join-Path $PSScriptRoot "dist"
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
-$asset = Join-Path $dist "Rhea-$tag-windows-x64.exe"
+$asset = Join-Path $dist "Rhea-Setup-$tag-windows-x64.exe"
 Copy-Item -LiteralPath $built -Destination $asset -Force
 Write-Host "Built $asset" -ForegroundColor Green
 
@@ -105,7 +105,7 @@ function Test-Release {
 if (-not (Test-Release)) {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    try { & gh release create $tag --title "Rhea $tag" --generate-notes *> $null } finally { $ErrorActionPreference = $previous }
+    try { & gh release create $tag --title "Rhea $tag" --generate-notes --notes "Windows: download the Rhea-Setup file and run it. It installs Rhea, adds it to the Start menu (search for Rhea) and starts it. macOS: open the .dmg and drag Rhea to Applications." *> $null } finally { $ErrorActionPreference = $previous }
     # the macOS workflow may have created it a moment earlier
     if (-not (Test-Release)) { throw "Could not create the release $tag." }
 }

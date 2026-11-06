@@ -1,6 +1,6 @@
 # Installing and updating (Windows)
 
-The release file `Rhea-v<version>-windows-x64.exe` is its own installer.
+The release file `Rhea-Setup-v<version>-windows-x64.exe` is its own installer.
 
 When you run it from anywhere other than the install folder, it:
 
