@@ -12,7 +12,36 @@ const POLL_ENDPOINT: &str = "https://auth.openai.com/api/accounts/deviceauth/tok
 const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 pub const VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
-const SERVICE: &str = "JARVUS";
+const SERVICE: &str = "Rhea";
+/// What earlier versions called the credential store entry; a saved login under it is moved over
+/// the first time it is needed.
+const LEGACY_SERVICE: &str = "JARVUS";
+
+thread_local! {
+    static SERVICE_NAME: std::cell::Cell<&'static str> = const { std::cell::Cell::new(SERVICE) };
+}
+
+fn service() -> &'static str {
+    SERVICE_NAME.with(std::cell::Cell::get)
+}
+
+/// Run `action` against the old entry names (this thread only).
+fn with_legacy_service<T>(action: impl FnOnce() -> T) -> T {
+    SERVICE_NAME.with(|name| name.set(LEGACY_SERVICE));
+    let result = action();
+    SERVICE_NAME.with(|name| name.set(SERVICE));
+    result
+}
+
+/// A login saved by an earlier version: read it, save it under the new name and remove the old
+/// entries, so the user stays signed in.
+fn migrate_legacy_login() -> Option<Tokens> {
+    let old = with_legacy_service(load).ok()?;
+    if save(&old).is_ok() {
+        let _ = with_legacy_service(delete_all_entries);
+    }
+    Some(old)
+}
 #[cfg(target_os = "macos")]
 const CREDENTIAL_STORE: &str = "macOS Keychain";
 #[cfg(target_os = "windows")]
@@ -77,7 +106,10 @@ pub fn token() -> Result<Tokens, String> {
     let mut tokens = match cached {
         Some(tokens) => tokens,
         None => {
-            let loaded = load()?;
+            let loaded = match load() {
+                Ok(loaded) => loaded,
+                Err(error) => migrate_legacy_login().ok_or(error)?,
+            };
             remember(Some(&loaded));
             loaded
         }
@@ -251,7 +283,13 @@ pub fn sign_in(
 
 pub fn sign_out() -> Result<(), String> {
     remember(None);
-    let single = keyring::Entry::new(SERVICE, SINGLE_ACCOUNT).map_err(|e| e.to_string())?;
+    // Also forget a login an earlier version left under its old name.
+    let _ = with_legacy_service(delete_all_entries);
+    delete_all_entries()
+}
+
+fn delete_all_entries() -> Result<(), String> {
+    let single = keyring::Entry::new(service(), SINGLE_ACCOUNT).map_err(|e| e.to_string())?;
     match single.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => {}
         Err(e) => return Err(format!("Could not clear the saved ChatGPT session: {e}")),
@@ -261,7 +299,7 @@ pub fn sign_out() -> Result<(), String> {
         delete_chunks(&generation, count)?;
     }
     for account in [MANIFEST_ACCOUNT, LEGACY_ACCOUNT] {
-        let entry = keyring::Entry::new(SERVICE, account).map_err(|e| e.to_string())?;
+        let entry = keyring::Entry::new(service(), account).map_err(|e| e.to_string())?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}
             Err(e) => return Err(format!("Could not clear the saved ChatGPT session: {e}")),
@@ -335,7 +373,7 @@ fn save(tokens: &Tokens) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn load() -> Result<Tokens, String> {
-    let entry = keyring::Entry::new(SERVICE, SINGLE_ACCOUNT).map_err(|e| e.to_string())?;
+    let entry = keyring::Entry::new(service(), SINGLE_ACCOUNT).map_err(|e| e.to_string())?;
     match entry.get_password() {
         Ok(raw) => return serde_json::from_str(&raw).map_err(|e| format!("Saved ChatGPT session is unreadable: {e}")),
         Err(keyring::Error::NoEntry) => {}
@@ -348,7 +386,7 @@ fn load() -> Result<Tokens, String> {
         if let Ok((generation, count)) = read_manifest() {
             let _ = delete_chunks(&generation, count);
         }
-        if let Ok(manifest) = keyring::Entry::new(SERVICE, MANIFEST_ACCOUNT) {
+        if let Ok(manifest) = keyring::Entry::new(service(), MANIFEST_ACCOUNT) {
             let _ = manifest.delete_credential();
         }
     }
@@ -358,7 +396,7 @@ fn load() -> Result<Tokens, String> {
 #[cfg(not(windows))]
 fn save(tokens: &Tokens) -> Result<(), String> {
     let raw = serde_json::to_string(tokens).map_err(|e| e.to_string())?;
-    let entry = keyring::Entry::new(SERVICE, SINGLE_ACCOUNT).map_err(|e| e.to_string())?;
+    let entry = keyring::Entry::new(service(), SINGLE_ACCOUNT).map_err(|e| e.to_string())?;
     entry
         .set_password(&raw)
         .map_err(|e| format!("Could not save ChatGPT credentials to {CREDENTIAL_STORE}: {e}"))
@@ -368,7 +406,7 @@ fn load_chunked() -> Result<Tokens, String> {
     let (generation, count) = match read_manifest() {
         Ok(value) => value,
         Err(_) => {
-            let legacy = keyring::Entry::new(SERVICE, LEGACY_ACCOUNT).map_err(|e| e.to_string())?;
+            let legacy = keyring::Entry::new(service(), LEGACY_ACCOUNT).map_err(|e| e.to_string())?;
             let raw = legacy
                 .get_password()
                 .map_err(|e| format!("No saved ChatGPT session: {e}"))?;
@@ -378,7 +416,7 @@ fn load_chunked() -> Result<Tokens, String> {
     };
     let mut raw = String::new();
     for index in 0..count {
-        let entry = keyring::Entry::new(SERVICE, &chunk_account(&generation, index))
+        let entry = keyring::Entry::new(service(), &chunk_account(&generation, index))
             .map_err(|e| e.to_string())?;
         raw.push_str(
             &entry
@@ -407,7 +445,7 @@ fn save_chunked(tokens: &Tokens) -> Result<(), String> {
         .map(|chunk| chunk.iter().collect())
         .collect();
     for (index, chunk) in chunks.iter().enumerate() {
-        let entry = keyring::Entry::new(SERVICE, &chunk_account(&generation, index))
+        let entry = keyring::Entry::new(service(), &chunk_account(&generation, index))
             .map_err(|e| e.to_string())?;
         if let Err(error) = entry.set_password(chunk) {
             let _ = delete_chunks(&generation, index + 1);
@@ -416,7 +454,7 @@ fn save_chunked(tokens: &Tokens) -> Result<(), String> {
             ));
         }
     }
-    let manifest = keyring::Entry::new(SERVICE, MANIFEST_ACCOUNT).map_err(|e| e.to_string())?;
+    let manifest = keyring::Entry::new(service(), MANIFEST_ACCOUNT).map_err(|e| e.to_string())?;
     if let Err(error) = manifest.set_password(&format!("{generation}:{}", chunks.len())) {
         let _ = delete_chunks(&generation, chunks.len());
         return Err(format!(
@@ -430,7 +468,7 @@ fn save_chunked(tokens: &Tokens) -> Result<(), String> {
 }
 
 fn read_manifest() -> Result<(String, usize), String> {
-    let entry = keyring::Entry::new(SERVICE, MANIFEST_ACCOUNT).map_err(|e| e.to_string())?;
+    let entry = keyring::Entry::new(service(), MANIFEST_ACCOUNT).map_err(|e| e.to_string())?;
     let value = entry.get_password().map_err(|e| e.to_string())?;
     let (generation, count) = value
         .split_once(':')
@@ -449,7 +487,7 @@ fn chunk_account(generation: &str, index: usize) -> String {
 fn delete_chunks(generation: &str, count: usize) -> Result<(), String> {
     let mut first_error = None;
     for index in 0..count {
-        let entry = keyring::Entry::new(SERVICE, &chunk_account(generation, index))
+        let entry = keyring::Entry::new(service(), &chunk_account(generation, index))
             .map_err(|e| e.to_string())?;
         if let Err(error) = entry.delete_credential() {
             if !matches!(error, keyring::Error::NoEntry) && first_error.is_none() {
@@ -465,7 +503,7 @@ fn delete_chunks(generation: &str, count: usize) -> Result<(), String> {
 fn client() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(30))
-        .user_agent(format!("JARVUS/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("Rhea/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| e.to_string())
 }

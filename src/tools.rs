@@ -1,6 +1,6 @@
 //! The one place a model tool call is executed: used by the main chat and by every
 //! subagent. It wraps each call with the user's hooks (PreToolUse / PostToolUse) and
-//! routes it to JEV, Shell, Chrome, an MCP server, or the team tools (`ask_user`,
+//! routes it to Rhea, Shell, Chrome, an MCP server, or the team tools (`ask_user`,
 //! `propose_plan`, `agent_*`).
 
 use std::{
@@ -37,6 +37,8 @@ pub struct ToolContext {
     pub model: String,
     pub effort: String,
     pub context_window: u64,
+    /// Fast mode (priority processing) for the runs this context starts.
+    pub fast: bool,
     /// Compose mode was on when this run started; spawned agents inherit read-only limits.
     pub compose: bool,
     /// Model for new subagents; empty = the same model as the caller.
@@ -51,11 +53,18 @@ impl ToolContext {
     }
 
     fn hooks(&self) -> HookRegistry {
+        // A skill installed or removed since the last call may have changed hooks.json.
+        crate::hooks::refresh_shared(&self.hooks);
         self.hooks.read().map(|hooks| hooks.clone()).unwrap_or_default()
     }
 }
 
 /// Tools sent with every request in addition to the built-in toolset: the Shell package.
+/// Tokens the built-in tool list adds to every request (about four characters per token).
+pub fn toolset_tokens() -> u64 {
+    (include_str!("toolset.json").chars().count() as u64).saturating_add(3) / 4
+}
+
 pub fn core_extra_tools() -> Vec<Value> {
     crate::shell::tool_specs().as_array().cloned().unwrap_or_default()
 }
@@ -79,6 +88,8 @@ pub fn dispatch(ctx: &ToolContext, name: &str, arguments: &Value) -> Result<Valu
         context_notes.extend(outcome.additional_context);
     }
     let result = dispatch_inner(ctx, name, &arguments);
+    // What actually happened (not what the model said) becomes memory, off the action path.
+    crate::memory::observe_tool(&ctx.chat_id, &ctx.agent_name, name, &arguments, &result);
     if hooks.has_hooks_for(HookEvent::PostToolUse) {
         let mut payload = base;
         payload["tool_input"] = arguments.clone();
@@ -119,6 +130,8 @@ fn dispatch_inner(ctx: &ToolContext, name: &str, arguments: &Value) -> Result<Va
         "agent_read" => agent_read(ctx, arguments),
         "agent_wait" => agent_wait(ctx, arguments),
         "agent_stop" => agent_stop(ctx, arguments),
+        "laya_decide" => crate::laya::decide_tool(arguments),
+        "memory_search" | "memory_remember" | "memory_forget" => crate::memory::tool(&ctx.chat_id, name, arguments),
         "use_skill" => crate::skills::load(arguments.get("name").and_then(Value::as_str).ok_or("`name` is required")?),
         "install_skill" => crate::skills::install(
             arguments.get("source").and_then(Value::as_str).ok_or("`source` is required (a GitHub link)")?,
@@ -127,7 +140,7 @@ fn dispatch_inner(ctx: &ToolContext, name: &str, arguments: &Value) -> Result<Va
         _ if name.starts_with("browser__") => {
             browser::execute_browser_command(&name["browser__".len()..], arguments.clone()).map_err(|error| error.to_string())
         }
-        _ if name.starts_with("mcp__jarvus_shell__") => crate::shell::execute(name, arguments),
+        _ if name.starts_with("mcp__rhea_shell__") => crate::shell::execute(name, arguments),
         _ if name.starts_with("mcp__") => call_mcp_tool(ctx, name, arguments),
         _ => jev::execute(name, arguments),
     }
@@ -176,7 +189,7 @@ fn list_mcps(ctx: &ToolContext) -> Result<Value, String> {
         .collect::<Vec<_>>();
     let browser_tools = browser_bridge["tools"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>();
     let answer_hint = format!(
-        "Live connection inventory (refreshed for this request). Configured MCP servers: {}. Chrome browser bridge (not a configured MCP server): {}. Its tools (load with get_tools_ chrome): {}. JARVUS Shell (built-in local connection): connected.",
+        "Live connection inventory (refreshed for this request). Configured MCP servers: {}. Chrome browser bridge (not a configured MCP server): {}. Its tools (load with get_tools_ chrome): {}. Rhea Shell (built-in local connection): connected.",
         if configured.is_empty() { "none".to_owned() } else { configured.join(", ") },
         if chrome_connected { "connected" } else { "disconnected" },
         browser_tools.join(", ")
@@ -205,7 +218,7 @@ fn get_tools(ctx: &ToolContext, arguments: &Value) -> Result<Value, String> {
             "note": "Chrome tools are now callable. Page elements are matched by visible label."}));
     }
     if key.contains("shell") {
-        return Ok(json!({"server": "shell", "note": "Shell tools are always loaded: mcp__jarvus_shell__*"}));
+        return Ok(json!({"server": "shell", "note": "Shell tools are always loaded: mcp__rhea_shell__*"}));
     }
     let manager = lock_manager(ctx)?;
     let config = manager
@@ -337,7 +350,7 @@ fn agent_runner(ctx: &ToolContext) -> Runner {
             hidden_tools: vec!["ask_user".into(), "propose_plan".into(), "agent_spawn".into()],
             inbox: Some(Box::new(move || team_inbox(&inbox_id, &chat_id, &last_status))),
             worker: true,
-            session_id: Some(format!("jarvus-{}-{}", base.chat_id, request.agent_id)),
+            session_id: Some(format!("rhea-{}-{}", base.chat_id, request.agent_id)),
             on_stop: None,
             hold_for_team: None,
             compact_percent: base.compact_percent,
@@ -346,6 +359,9 @@ fn agent_runner(ctx: &ToolContext) -> Runner {
                 let agent_id = request.agent_id.clone();
                 move |state| team::hub().set_agent_state(&agent_id, state)
             })),
+            ledger: Some(crate::ledger::Ledger::for_chat(&base.chat_id, &request.agent_id)),
+            endpoint: None,
+            fast: base.fast,
         };
         let outcome = chat::respond_with_options(
             &tokens.access_token,
@@ -367,6 +383,10 @@ fn agent_runner(ctx: &ToolContext) -> Runner {
                     update(Update::Tool(activity));
                 }
                 if let Some(usage) = event.usage {
+                    // Subagents' tokens count toward the lifetime total too (the system prompt and
+                    // tool list are what every request carries; memory is not sent to agents).
+                    let parts = crate::usage::Parts::of_request(usage.input_tokens, usage.output_tokens, chat::system_prompt_tokens(), crate::tools::toolset_tokens(), 0);
+                    crate::usage::record_request(usage.input_tokens, usage.output_tokens, parts);
                     update(Update::Usage(usage));
                 }
             },
@@ -482,7 +502,7 @@ mod tests {
 
     fn context(hooks: HookRegistry) -> ToolContext {
         ToolContext {
-            mcp_manager: Arc::new(Mutex::new(McpManager::new(std::env::temp_dir().join("jarvus-tools-test-mcp.json")))),
+            mcp_manager: Arc::new(Mutex::new(McpManager::new(std::env::temp_dir().join("rhea-tools-test-mcp.json")))),
             chrome_alive: Arc::new(AtomicBool::new(false)),
             hooks: Arc::new(RwLock::new(hooks)),
             chat_id: "chat-test-tools".into(),
@@ -491,6 +511,7 @@ mod tests {
             model: "test".into(),
             effort: "low".into(),
             context_window: 100_000,
+            fast: false,
             compose: false,
             subagent_model: String::new(),
             compact_percent: 80,

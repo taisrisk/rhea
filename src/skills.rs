@@ -1,5 +1,5 @@
 //! Skills: folders with a `SKILL.md` (YAML front matter `name` + `description`, then
-//! instructions) that JEV loads on demand. They behave like MCP servers: installed once, listed
+//! instructions) that Rhea loads on demand. They behave like MCP servers: installed once, listed
 //! to the model every run as a short catalog, loaded in full with `use_skill`, or forced with
 //! `/skill-name` in the chat box. `install_skill` fetches one from GitHub.
 
@@ -23,7 +23,7 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub dir: PathBuf,
-    /// Where it lives: "core" (built into the app), "jarvus", "agents" or "claude".
+    /// Where it lives: "core" (built into the app), "rhea", "agents" or "claude".
     pub source: &'static str,
 }
 
@@ -55,15 +55,15 @@ fn home() -> PathBuf {
     env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")).map(PathBuf::from).unwrap_or_else(env::temp_dir)
 }
 
-/// The folder JARVUS installs skills into.
+/// The folder Rhea installs skills into.
 pub fn install_root() -> PathBuf {
-    home().join(".jarvus").join("skills")
+    home().join(crate::chat_store::DATA_DIR).join("skills")
 }
 
-/// Skill folders searched, first match wins: JARVUS's own, then the shared agent folders.
+/// Skill folders searched, first match wins: Rhea's own, then the shared agent folders.
 pub fn roots() -> Vec<(PathBuf, &'static str)> {
     let home = home();
-    vec![(install_root(), "jarvus"), (home.join(".agents").join("skills"), "agents"), (home.join(".claude").join("skills"), "claude")]
+    vec![(install_root(), "rhea"), (home.join(".agents").join("skills"), "agents"), (home.join(".claude").join("skills"), "claude")]
 }
 
 /// Split `---` front matter from the body. Handles quoted values and `>` / `|` block scalars.
@@ -116,19 +116,53 @@ fn read_skill(dir: &Path, source: &'static str) -> Option<Skill> {
     (!name.is_empty()).then(|| Skill { name, description: description.unwrap_or_default(), dir: dir.to_path_buf(), source })
 }
 
+/// A fingerprint of everything in a skill folder (file names and contents), so the same skill
+/// found in two folders can be told apart from two different skills that share a name.
+fn fingerprint(dir: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut files = Vec::new();
+    collect_files(dir, dir, 0, &mut files);
+    files.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for relative in files.iter().take(400) {
+        relative.hash(&mut hasher);
+        fs::read(dir.join(relative)).unwrap_or_default().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Skills from every folder, the first folder winning. A copy in a later folder (for example
+/// `~/.agents/skills`) is hidden only when it is the very same skill: same name and same files.
+/// A different skill that happens to share a name stays visible under `<name>-<folder>`.
 pub fn list_in(roots: &[(PathBuf, &'static str)]) -> Vec<Skill> {
-    let mut seen = HashSet::new();
+    let mut seen: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
+    let mut taken: HashSet<String> = HashSet::new();
     let mut skills = Vec::new();
     for (root, source) in roots {
         let Ok(entries) = fs::read_dir(root) else { continue };
         let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
         dirs.sort();
         for dir in dirs {
-            if let Some(skill) = read_skill(&dir, source) {
-                if seen.insert(skill.name.clone()) {
-                    skills.push(skill);
+            let Some(mut skill) = read_skill(&dir, source) else { continue };
+            let print = fingerprint(&dir);
+            match seen.get_mut(&skill.name) {
+                None => {
+                    seen.insert(skill.name.clone(), vec![print]);
+                }
+                Some(prints) if prints.contains(&print) => continue,
+                Some(prints) => {
+                    prints.push(print);
+                    let mut renamed = format!("{}-{source}", skill.name);
+                    let mut counter = 2;
+                    while taken.contains(&renamed) {
+                        renamed = format!("{}-{source}-{counter}", skill.name);
+                        counter += 1;
+                    }
+                    skill.name = renamed;
                 }
             }
+            taken.insert(skill.name.clone());
+            skills.push(skill);
         }
     }
     skills
@@ -164,6 +198,14 @@ pub fn find(name: &str) -> Option<Skill> {
 
 /// A skill's full text for the model: instructions plus the files that sit next to it.
 pub fn load(name: &str) -> Result<Value, String> {
+    let loaded = load_skill(name);
+    if loaded.is_ok() {
+        crate::usage::record_skill(name);
+    }
+    loaded
+}
+
+fn load_skill(name: &str) -> Result<Value, String> {
     let skill = find(name).ok_or_else(|| {
         let names: Vec<String> = list().into_iter().map(|s| s.name).collect();
         format!("No skill named '{name}'. Installed skills: {}.", if names.is_empty() { "none".into() } else { names.join(", ") })
@@ -229,9 +271,11 @@ pub fn remove(name: &str) -> Result<(), String> {
     let key = sanitize_name(name);
     let dir = install_root().join(&key);
     if key.is_empty() || !dir.join("SKILL.md").is_file() {
-        return Err(format!("'{name}' is not a skill installed by JARVUS."));
+        return Err(format!("'{name}' is not a skill installed by Rhea."));
     }
-    fs::remove_dir_all(&dir).map_err(|e| format!("Could not remove the skill: {e}"))
+    fs::remove_dir_all(&dir).map_err(|e| format!("Could not remove the skill: {e}"))?;
+    crate::hooks::remove_skill_hooks(&key);
+    Ok(())
 }
 
 // ---- installing from GitHub ------------------------------------------------------------
@@ -276,7 +320,7 @@ pub fn parse_github(source: &str) -> Result<GithubSource, String> {
 fn http() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(180))
-        .user_agent(format!("JARVUS/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("Rhea/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| e.to_string())
 }
@@ -370,6 +414,13 @@ fn extract_dir(bytes: &[u8], dir: &str) -> Result<Downloaded, String> {
     Ok(out)
 }
 
+/// The files of one folder of a public GitHub repository (default branch), relative to it.
+pub fn fetch_folder(repo: &str, dir: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let source = parse_github(repo)?;
+    let archive = fetch_archive(&source)?;
+    Ok(extract_dir(&archive, dir)?.files)
+}
+
 /// Write downloaded files as `<root>/<name>/`, replacing an older copy only once everything arrived.
 fn write_skill(root: &Path, name: &str, files: &[(String, Vec<u8>)]) -> Result<PathBuf, String> {
     let staging = root.join(format!(".installing-{name}"));
@@ -390,7 +441,7 @@ fn write_skill(root: &Path, name: &str, files: &[(String, Vec<u8>)]) -> Result<P
     Ok(destination)
 }
 
-/// Install a skill from a GitHub link into `~/.jarvus/skills`.
+/// Install a skill from a GitHub link into `~/.rhea/skills`.
 pub fn install(source: &str, name_override: Option<&str>) -> Result<Value, String> {
     let github = parse_github(source)?;
     let archive = fetch_archive(&github)?;
@@ -430,16 +481,34 @@ fn install_from_archive(github: &GithubSource, archive: &[u8], name_override: Op
     }
     fs::create_dir_all(root).map_err(|e| format!("Could not create {}: {e}", root.display()))?;
     let destination = write_skill(root, &name, &downloaded.files)?;
+    // A skill can ship hooks (Claude Code format): register them so they run without the user
+    // having to wire anything. Only done for the real install folder, never for test folders.
+    let (hooks, hook_error) = if root == install_root() {
+        match crate::hooks::install_skill_hooks(&name, &destination) {
+            Ok(lines) => (lines, None),
+            Err(error) => (Vec::new(), Some(error)),
+        }
+    } else {
+        (Vec::new(), None)
+    };
+    let mut note = "Installed. Call use_skill with this name to read it, or the user can type /name.".to_owned();
+    if !hooks.is_empty() {
+        note.push_str(" Its hooks were registered too (see Settings > Agents, skills & hooks).");
+    }
+    if let Some(error) = &hook_error {
+        note.push_str(&format!(" Its hooks could not be installed: {error}"));
+    }
     Ok(json!({
         "installed": name,
         "description": description.unwrap_or_default(),
         "files": downloaded.files.len(),
         "directory": destination.display().to_string(),
-        "note": "Installed. Call use_skill with this name to read it, or the user can type /name."
+        "hooks_installed": hooks,
+        "note": note
     }))
 }
 
-/// Skills every JARVUS install starts with (fetched once, in the background, on first launch).
+/// Skills every Rhea install starts with (fetched once, in the background, on first launch).
 pub const BUNDLED: [&str; 2] = ["https://github.com/Leonxlnx/taste-skill", "https://github.com/heydamir/unslop"];
 
 fn bundled_marker() -> PathBuf {
@@ -475,7 +544,7 @@ mod tests {
     use super::*;
 
     fn temp(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("jarvus-skills-{name}-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("rhea-skills-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -519,15 +588,16 @@ mod tests {
     fn listing_prefers_the_first_root_and_skips_folders_without_skill_md() {
         let a = temp("list-a");
         let b = temp("list-b");
-        for (root, desc) in [(&a, "first"), (&b, "second")] {
+        // the very same skill in both folders: only the first is listed
+        for root in [&a, &b] {
             let dir = root.join("alpha");
             fs::create_dir_all(&dir).unwrap();
-            fs::write(dir.join("SKILL.md"), format!("---\nname: alpha\ndescription: {desc}\n---\nbody")).unwrap();
+            fs::write(dir.join("SKILL.md"), "---\nname: alpha\ndescription: first\n---\nbody").unwrap();
         }
         fs::create_dir_all(b.join("empty")).unwrap();
         fs::create_dir_all(b.join("beta")).unwrap();
         fs::write(b.join("beta").join("SKILL.md"), "plain body without front matter").unwrap();
-        let skills = list_in(&[(a.clone(), "jarvus"), (b.clone(), "agents")]);
+        let skills = list_in(&[(a.clone(), "rhea"), (b.clone(), "agents")]);
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["alpha", "beta"]);
         assert_eq!(skills[0].description, "first");
@@ -557,14 +627,46 @@ mod tests {
         // SAFETY: single-threaded ignored test; points the install root at a throwaway folder.
         unsafe { env::set_var("USERPROFILE", &home) };
         ensure_bundled();
-        let names: Vec<String> = list_in(&[(install_root(), "jarvus")]).into_iter().map(|s| s.name).collect();
+        let names: Vec<String> = list_in(&[(install_root(), "rhea")]).into_iter().map(|s| s.name).collect();
         println!("installed: {names:?}");
         assert_eq!(names.len(), 2, "{names:?}");
-        assert!(home.join(".jarvus/skills/.bundled.json").is_file());
+        assert!(home.join(".rhea/skills/.bundled.json").is_file());
         let taste = names.iter().find(|n| n.contains("taste")).unwrap();
         assert!(load(taste).unwrap()["instructions"].as_str().unwrap().len() > 5_000);
         let unslop = load("unslop").unwrap();
         assert!(unslop["files"].as_array().unwrap().len() > 3);
+    }
+
+    fn put_skill(root: &Path, folder: &str, text: &str, extra: Option<(&str, &str)>) {
+        let dir = root.join(folder);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), text).unwrap();
+        if let Some((name, body)) = extra {
+            fs::write(dir.join(name), body).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_same_skill_in_two_folders_is_listed_once_and_the_own_copy_wins() {
+        let own = temp("dedupe-own");
+        let shared = temp("dedupe-agents");
+        let text = "---\nname: taste\ndescription: d\n---\nbody";
+        put_skill(&own, "taste", text, Some(("rules.md", "same")));
+        put_skill(&shared, "taste", text, Some(("rules.md", "same")));
+        let found = list_in(&[(own.clone(), "rhea"), (shared.clone(), "agents")]);
+        assert_eq!(found.len(), 1, "{:?}", found.iter().map(|s| (&s.name, s.source)).collect::<Vec<_>>());
+        assert_eq!(found[0].source, "rhea");
+    }
+
+    #[test]
+    fn a_different_skill_with_the_same_name_stays_visible_under_its_own_name() {
+        let own = temp("differ-own");
+        let shared = temp("differ-agents");
+        put_skill(&own, "taste", "---\nname: taste\n---\nmine", None);
+        put_skill(&shared, "taste", "---\nname: taste\n---\nsomeone else's version", None);
+        put_skill(&shared, "extra", "---\nname: extra\n---\nonly here", None);
+        let names: Vec<(String, &str)> = list_in(&[(own, "rhea"), (shared, "agents")]).into_iter().map(|s| (s.name, s.source)).collect();
+        assert_eq!(names, [("taste".to_owned(), "rhea"), ("extra".to_owned(), "agents"), ("taste-agents".to_owned(), "agents")]);
     }
 
     fn archive_with(entries: &[(&str, &str)]) -> Vec<u8> {
@@ -598,7 +700,7 @@ mod tests {
         assert_eq!(done["files"], 2);
         assert!(root.join("pretty-ui/references/a.md").is_file());
         assert!(!root.join("pretty-ui/node_modules").exists());
-        let found = list_in(&[(root.clone(), "jarvus")]);
+        let found = list_in(&[(root.clone(), "rhea")]);
         assert_eq!(found[0].name, "pretty-ui");
     }
 

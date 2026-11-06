@@ -1,12 +1,12 @@
-// JARVUS Browser Bridge: connects to the local JARVUS native host as soon as
-// Chrome runs and stays connected, so JEV can work with any tab without a
+// Rhea Browser Bridge: connects to the local Rhea native host as soon as
+// Chrome runs and stays connected, so Rhea can work with any tab without a
 // popup click. Tab-level commands run here; page-level commands run in the
 // content script (content.js), which is injected on demand.
 
-const NATIVE_HOST = "com.jarvus.browser";
+const NATIVE_HOST = "com.rhea.browser";
 const PAGE_METHODS = new Set(["snapshot", "click", "type", "select", "press", "scroll", "extract", "wait", "hover"]);
 const TAB_METHODS = new Set(["ping", "tabs", "activate", "open", "close", "navigate", "back", "forward", "reload"]);
-const KEEPALIVE_ALARM = "jarvus-keepalive";
+const KEEPALIVE_ALARM = "rhea-keepalive";
 
 let nativePort = null;
 let connectedAt = null;
@@ -19,7 +19,7 @@ function status() {
 }
 
 function broadcastStatus() {
-  chrome.runtime.sendMessage({ type: "jarvus-status", status: status() }).catch(() => {});
+  chrome.runtime.sendMessage({ type: "rhea-status", status: status() }).catch(() => {});
 }
 
 function scheduleReconnect() {
@@ -42,7 +42,7 @@ function connectNative() {
       });
     });
     port.onDisconnect.addListener(() => {
-      lastError = chrome.runtime.lastError?.message || "JARVUS native host disconnected";
+      lastError = chrome.runtime.lastError?.message || "Rhea native host disconnected";
       nativePort = null;
       connectedAt = null;
       broadcastStatus();
@@ -61,7 +61,7 @@ function connectNative() {
 }
 
 function post(message) {
-  if (!nativePort) throw new Error("JARVUS native host is disconnected");
+  if (!nativePort) throw new Error("Rhea native host is disconnected");
   nativePort.postMessage(message);
 }
 
@@ -183,8 +183,8 @@ async function runTabMethod(method, params) {
 
 async function runPageMethod(method, params) {
   const tab = await resolveTab(params);
-  if (!/^https?:/.test(tab.url || "")) throw new Error(`Tab '${tab.title}' is a browser page JARVUS cannot read (${(tab.url || "").split(":")[0]})`);
-  const send = () => chrome.tabs.sendMessage(tab.id, { jarvus: true, method, params });
+  if (!/^https?:/.test(tab.url || "")) throw new Error(`Tab '${tab.title}' is a browser page Rhea cannot read (${(tab.url || "").split(":")[0]})`);
+  const send = () => chrome.tabs.sendMessage(tab.id, { rhea: true, method, params });
   let result;
   try {
     result = await send();

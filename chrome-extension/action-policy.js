@@ -5,7 +5,7 @@
       return consequentialAction.test(String(value || ""));
     },
   });
-  Object.defineProperty(globalThis, "JarvusActionPolicy", {
+  Object.defineProperty(globalThis, "RheaActionPolicy", {
     value: api,
     configurable: true,
     writable: false,

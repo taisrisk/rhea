@@ -32,7 +32,9 @@ const MAX_ENV_VARS: usize = 128;
 const MAX_ENV_VALUE_BYTES: usize = 32 * 1024;
 const MAX_ENV_TOTAL_BYTES: usize = 1024 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
-const KEYRING_SERVICE: &str = "JARVUS-mcp";
+const KEYRING_SERVICE: &str = "Rhea-mcp";
+/// The entry name earlier versions used; secrets saved under it are moved over when first read.
+const LEGACY_KEYRING_SERVICE: &str = "JARVUS-mcp";
 const MAX_HTTP_BODY_BYTES: usize = MAX_RESULT_BYTES;
 const MCP_HTTP_PROTOCOL: &str = "2025-11-25";
 
@@ -532,7 +534,7 @@ impl Connection {
                     json!({
                         "protocolVersion": version,
                         "capabilities": {},
-                        "clientInfo": {"name":"JARVUS", "version": env!("CARGO_PKG_VERSION")}
+                        "clientInfo": {"name":"Rhea", "version": env!("CARGO_PKG_VERSION")}
                     }),
                     false,
                 ) {
@@ -619,7 +621,7 @@ impl Connection {
             use std::os::windows::process::CommandExt;
             // MCP servers are background workers. In particular, shell-backed
             // servers must not create/activate a console that steals focus from
-            // the application JEV is controlling.
+            // the application Rhea is controlling.
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         for (key, value) in &cfg.env {
@@ -672,7 +674,7 @@ impl Connection {
             json!({
                 "protocolVersion": PROTOCOL_LEGACY,
                 "capabilities": {},
-                "clientInfo": {"name":"JARVUS", "version": env!("CARGO_PKG_VERSION")}
+                "clientInfo": {"name":"Rhea", "version": env!("CARGO_PKG_VERSION")}
             }),
             false,
         )?;
@@ -792,7 +794,7 @@ impl Connection {
             if let Some(object) = params.as_object_mut() {
                 object.insert("_meta".into(), json!({
                     "io.modelcontextprotocol/protocolVersion": PROTOCOL_MODERN,
-                    "io.modelcontextprotocol/clientInfo": {"name":"JARVUS", "version":env!("CARGO_PKG_VERSION")},
+                    "io.modelcontextprotocol/clientInfo": {"name":"Rhea", "version":env!("CARGO_PKG_VERSION")},
                     "io.modelcontextprotocol/clientCapabilities": {}
                 }));
             }
@@ -1503,7 +1505,7 @@ pub fn default_config_path() -> PathBuf {
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join(".jarvus")
+        .join(crate::chat_store::DATA_DIR)
         .join("mcp-servers.json")
 }
 
@@ -1790,6 +1792,21 @@ fn save_credentials(
         .map_err(|e| format!("Could not clear legacy MCP credentials: {e}"))
 }
 
+/// Secrets an earlier version saved under the old entry name: copy them to `new_entry` and remove
+/// the old ones.
+fn take_from_legacy_service(id: &str, new_entry: &keyring::Entry) -> Option<String> {
+    for account in [keyring_account(id), legacy_keyring_account(id)] {
+        let old = keyring::Entry::new(LEGACY_KEYRING_SERVICE, &account).ok()?;
+        if let Ok(raw) = old.get_password() {
+            if new_entry.set_password(&raw).is_ok() {
+                let _ = delete_keyring_credential(&old);
+            }
+            return Some(raw);
+        }
+    }
+    None
+}
+
 fn delete_keyring_credential(entry: &keyring::Entry) -> Result<(), keyring::Error> {
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -1826,7 +1843,10 @@ fn load_credentials_uncached(
                 .map_err(|e| e.to_string())?;
             match legacy.get_password() {
                 Ok(raw) => raw,
-                Err(keyring::Error::NoEntry) => return Ok((BTreeMap::new(), BTreeMap::new())),
+                Err(keyring::Error::NoEntry) => match take_from_legacy_service(id, &entry) {
+                    Some(raw) => raw,
+                    None => return Ok((BTreeMap::new(), BTreeMap::new())),
+                },
                 Err(error) => return Err(format!("Could not read saved MCP credentials: {error}")),
             }
         }
@@ -1937,7 +1957,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "jarvus-mcp-{label}-{}-{nonce}.json",
+            "rhea-mcp-{label}-{}-{nonce}.json",
             std::process::id()
         ))
     }
@@ -2425,7 +2445,7 @@ mod tests {
     #[test]
     fn legacy_server_that_exits_on_discovery_is_restarted_for_initialize() {
         let marker = std::env::temp_dir().join(format!(
-            "jarvus-mcp-discovery-{}-{}.marker",
+            "rhea-mcp-discovery-{}-{}.marker",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2433,8 +2453,8 @@ mod tests {
                 .as_nanos()
         ));
         let script = r#"
-$firstProcess = -not (Test-Path $env:JARVUS_MCP_DISCOVERY_MARKER)
-if ($firstProcess) { Set-Content -NoNewline -Path $env:JARVUS_MCP_DISCOVERY_MARKER -Value 'probed' }
+$firstProcess = -not (Test-Path $env:RHEA_MCP_DISCOVERY_MARKER)
+if ($firstProcess) { Set-Content -NoNewline -Path $env:RHEA_MCP_DISCOVERY_MARKER -Value 'probed' }
 while ($line = [Console]::In.ReadLine()) {
   $message = ConvertFrom-Json $line
   if ($firstProcess -and $message.method -eq 'server/discover') { break }
@@ -2462,7 +2482,7 @@ while ($line = [Console]::In.ReadLine()) {
             url: None,
             sse: false,
             env: BTreeMap::from([(
-                "JARVUS_MCP_DISCOVERY_MARKER".into(),
+                "RHEA_MCP_DISCOVERY_MARKER".into(),
                 marker.to_string_lossy().into_owned(),
             )]),
             headers: BTreeMap::new(),

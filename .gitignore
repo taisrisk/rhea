@@ -20,7 +20,8 @@ dist/
 *.egg-info/
 /target/
 /target-*/
-/JARVUS.exe
+/Rhea*.exe
+/rhea*.exe
 *.pdb
 *.dSYM/
 *.app/
@@ -44,8 +45,18 @@ debug-screens/
 *.log
 
 # Obsidian local workspace state is user-specific; keep the vault itself.
-JARVUS VAULT/.obsidian/workspace.json
-JARVUS VAULT/.obsidian/cache/
+RHEA VAULT/.obsidian/workspace.json
+RHEA VAULT/.obsidian/cache/
+
+# Release output made by build.ps1 (the exe is uploaded to the GitHub release, never committed)
+/dist/
+*.rar
+
+# The local model runtime and downloads live in ~/.rhea/laya, never in the repo
+/laya/
+/laya-*/
+*.safetensors
+*.onnx
 
 # Local-only tooling, planning notes and captures
 *.exe

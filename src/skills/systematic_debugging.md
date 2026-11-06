@@ -1,6 +1,6 @@
 # Core skill: systematic debugging
 
-(Adapted for JARVUS from the MIT-licensed `systematic-debugging` skill in obra/superpowers. This skill is always active.)
+(Adapted for Rhea from the MIT-licensed `systematic-debugging` skill in obra/superpowers. This skill is always active.)
 
 ## Overview
 
@@ -268,7 +268,7 @@ If systematic investigation reveals issue is truly environmental, timing-depende
 
 **But:** 95% of "no root cause" cases are incomplete investigation.
 
-## Applying this in JARVUS
+## Applying this in Rhea
 
 - **Reproduce with Shell.** Run the failing command through `run_command` (set `working_directory`
   and read `exit_code`, `stdout`, `stderr`; a nonzero exit is a failure whatever the stdout says).

@@ -5,29 +5,45 @@ mod auth;
 mod browser;
 mod chat;
 mod chat_store;
+mod chrome_ext;
 mod compose;
 mod desktop;
 mod hooks;
+mod installer;
 mod jev;
+mod laya;
+mod ledger;
 #[cfg(target_os = "macos")]
 mod macos;
 mod mcp;
+mod research;
+#[cfg(test)]
+mod replay;
+mod memory;
 mod shell;
 mod skills;
+mod spelling;
 mod team;
 mod tools;
 mod uia;
+mod usage;
 
 use std::sync::Arc;
 
 fn main() {
+    // Data from a version that still called its folder ~/.rhea moves to ~/.rhea first.
+    chat_store::migrate_legacy_data();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.first().is_some_and(|argument| {
         argument == "--native-messaging-host" || argument.starts_with("chrome-extension://")
     }) {
         if let Err(error) = browser::run_native_messaging_host() {
-            eprintln!("JARVUS Chrome bridge failed: {error}");
+            eprintln!("Rhea Chrome bridge failed: {error}");
         }
+        return;
+    }
+    // The downloaded exe installs itself (and replaces an older install) before anything opens.
+    if installer::run_install_step() == installer::Startup::Exit {
         return;
     }
     // An app opened from Finder gets a bare PATH; give child processes (MCP servers, Agent
@@ -45,7 +61,7 @@ fn show_startup_error(error: &str) {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
     let message: Vec<u16> = OsStr::new(error).encode_wide().chain(Some(0)).collect();
-    let title: Vec<u16> = OsStr::new("JARVUS could not start")
+    let title: Vec<u16> = OsStr::new("Rhea could not start")
         .encode_wide()
         .chain(Some(0))
         .collect();
@@ -61,12 +77,12 @@ fn show_startup_error(error: &str) {
 
 #[cfg(not(target_os = "windows"))]
 fn show_startup_error(error: &str) {
-    eprintln!("JARVUS could not start: {error}");
+    eprintln!("Rhea could not start: {error}");
 }
 
 fn run_gui() -> eframe::Result {
-    let icon_image = image::load_from_memory(include_bytes!("../assets/jarvus-mark.png"))
-        .expect("embedded JARVUS icon must be a valid PNG")
+    let icon_image = image::load_from_memory(include_bytes!("../assets/rhea-mark.png"))
+        .expect("embedded Rhea icon must be a valid PNG")
         .into_rgba8();
     let (icon_width, icon_height) = icon_image.dimensions();
     let icon = Arc::new(eframe::egui::IconData {
@@ -76,7 +92,7 @@ fn run_gui() -> eframe::Result {
     });
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("JARVUS")
+            .with_title("Rhea")
             .with_icon(icon)
             .with_inner_size([1440.0, 920.0])
             .with_min_inner_size([1024.0, 680.0])
@@ -87,20 +103,20 @@ fn run_gui() -> eframe::Result {
     };
 
     eframe::run_native(
-        "JARVUS",
+        "Rhea",
         options,
         Box::new(|creation_context| {
             let mut fonts = eframe::egui::FontDefinitions::default();
             if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
                 fonts.font_data.insert(
-                    "jarvus-segoe".into(),
+                    "rhea-segoe".into(),
                     Arc::new(eframe::egui::FontData::from_owned(bytes)),
                 );
                 if let Some(proportional) = fonts
                     .families
                     .get_mut(&eframe::egui::FontFamily::Proportional)
                 {
-                    proportional.insert(0, "jarvus-segoe".into());
+                    proportional.insert(0, "rhea-segoe".into());
                 }
             }
             egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
@@ -170,7 +186,7 @@ fn run_gui() -> eframe::Result {
                     style.interaction.selectable_labels = false;
                     style.animation_time = 0.15;
                 });
-            Ok(Box::new(app::JarvusApp::default()))
+            Ok(Box::new(app::RheaApp::default()))
         }),
     )
 }

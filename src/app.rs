@@ -16,8 +16,18 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod archive_ui;
+mod chrome_ui;
+mod laya_ui;
+mod memory_ui;
+mod motion;
+mod runs_ui;
 mod team_ui;
+mod update_ui;
+mod usage_ui;
 mod transcript;
+use archive_ui::{ArchivePreview, ArchivedChat};
+use motion::{PANEL_SECS, Spinner, ease_out, hover_t, orb, press_scale, scale_rect, stagger, toggle_switch};
 use team_ui::{AskUi, SideTab, title_case};
 
 use crate::{
@@ -26,12 +36,15 @@ use crate::{
     chat_store,
     desktop::{self, SnapshotResult},
     hooks::{HookEvent, HookRegistry},
+    ledger,
     mcp::{self, McpManager, McpServerConfig},
     skills, team, tools,
 };
 
 /// Every UI transition is this long at most: quick and snappy.
 const ANIM: f32 = 0.15;
+/// The context window easing when the model changes: slower than a hover so the change reads.
+const LIMIT_ANIM: f32 = 0.45;
 
 /// How wide a queued-message bubble may get inside the space it was given.
 fn row_width_cap(ui: &egui::Ui) -> f32 {
@@ -80,6 +93,8 @@ const GLOW_GREEN: [u8; 3] = [52, 170, 98];
 const DANGER: Color32 = Color32::from_rgb(232, 118, 106);
 const SYSTEM_PROMPT_SEGMENT: Color32 = Color32::from_rgb(74, 186, 118);
 const TOOLSET_SEGMENT: Color32 = Color32::from_rgb(150, 154, 152);
+/// Lime: what long-term memory added to the context.
+const MEMORY_SEGMENT: Color32 = Color32::from_rgb(163, 230, 53);
 const INK: Color32 = Color32::from_rgb(238, 239, 237);
 const MUTED: Color32 = Color32::from_rgb(140, 144, 142);
 const LINE: Color32 = Color32::from_rgb(40, 42, 41);
@@ -99,8 +114,10 @@ enum CompletedOperation {
     ChatLatency(u128),
     ChatUsage(chat::Usage),
     ContextCompacted(chat::CompactionUpdate),
+    /// What long-term memory added to this message's request (0 when nothing matched).
+    MemoryBriefing { chat_id: String, tokens: u64, count: usize },
     /// A manual `/compact`: the new summary and how many leading turns it covers.
-    Compacted(Result<(String, usize), String>),
+    Compacted(Result<CompactOutcome, String>),
     Apps(Value),
     Windows(Value),
     Screenshot(Value),
@@ -125,6 +142,9 @@ struct Conversation {
     context_summary: String,
     #[serde(default)]
     summary_through: usize,
+    /// Slash commands shown between turns with their outcome (see `ChatNote`).
+    #[serde(default)]
+    notes: Vec<ChatNote>,
     /// Locally estimated tokens in this chat's current effective context (summary + live turns).
     #[serde(default)]
     context_tokens: u64,
@@ -142,6 +162,38 @@ struct Conversation {
     loaded: bool,
 }
 
+/// A slash command and what it did, shown in the transcript between turns. It is not a message to
+/// the model, so the model's own transcript never sees it.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct ChatNote {
+    /// How many turns the chat had when the command ran; the note sits after them.
+    #[serde(default)]
+    at_turn: usize,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    detail: String,
+    #[serde(default)]
+    failed: bool,
+}
+
+/// A `/compact` in progress: the transcript shows its clock until the result comes back.
+struct CompactRun {
+    chat_id: String,
+    at_turn: usize,
+    started: Instant,
+}
+
+/// What a finished `/compact` reports.
+struct CompactOutcome {
+    summary: String,
+    through: usize,
+    compacted_tokens: u64,
+    summary_tokens: u64,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct ConversationStore {
     #[serde(default)]
@@ -152,6 +204,8 @@ struct ConversationStore {
 
 #[derive(Default, Serialize, Deserialize)]
 struct StoredHistory {
+    #[serde(default)]
+    notes: Vec<ChatNote>,
     #[serde(default)]
     turns: Vec<Turn>,
     #[serde(default)]
@@ -174,19 +228,43 @@ enum SettingsSection {
     Mcp,
     Browser,
     Agents,
+    Memory,
+    Laya,
+    Archived,
     Storage,
 }
 
 impl SettingsSection {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 10] = [
         Self::Chat,
         Self::Usage,
         Self::Connections,
         Self::Mcp,
         Self::Browser,
         Self::Agents,
+        Self::Memory,
+        Self::Laya,
+        Self::Archived,
         Self::Storage,
     ];
+
+    /// `RHEA_DEMO_SETTINGS=<key>` opens the settings window on a page; it is how the screenshots in
+    /// docs/screenshots are produced, one page at a time.
+    fn from_key(key: &str) -> Option<Self> {
+        Some(match key {
+            "chat" => Self::Chat,
+            "usage" => Self::Usage,
+            "connections" => Self::Connections,
+            "mcp" => Self::Mcp,
+            "browser" => Self::Browser,
+            "agents" => Self::Agents,
+            "memory" => Self::Memory,
+            "local" => Self::Laya,
+            "archived" => Self::Archived,
+            "storage" => Self::Storage,
+            _ => return None,
+        })
+    }
 
     fn icon(self) -> &'static str {
         match self {
@@ -196,6 +274,9 @@ impl SettingsSection {
             Self::Mcp => "plug",
             Self::Browser => "globe",
             Self::Agents => "agents",
+            Self::Memory => "brain",
+            Self::Laya => "bolt",
+            Self::Archived => "archive",
             Self::Storage => "storage",
         }
     }
@@ -208,12 +289,15 @@ impl SettingsSection {
             Self::Mcp => "MCP servers",
             Self::Browser => "Browser",
             Self::Agents => "Agents & hooks",
+            Self::Memory => "Memory",
+            Self::Laya => "Local model",
+            Self::Archived => "Archived chats",
             Self::Storage => "Storage",
         }
     }
 }
 
-pub struct JarvusApp {
+pub struct RheaApp {
     target_app: String,
     target_window_id: String,
     surface: String,
@@ -273,12 +357,36 @@ pub struct JarvusApp {
     assistant_started_at: Option<Instant>,
     notice: String,
     scroll_to_bottom: bool,
-    show_tools: bool,
     show_settings: bool,
     settings_section: SettingsSection,
     native_frame_style_attempted: bool,
     /// Updated every few seconds by a background ping of the Chrome bridge.
     chrome_alive: Arc<std::sync::atomic::AtomicBool>,
+    /// Which history row has its options menu open.
+    chat_menu_open: Option<usize>,
+    memory_view: memory_ui::MemoryView,
+    memory_job: Arc<Mutex<memory_ui::MemoryJob>>,
+    update: Arc<Mutex<update_ui::UpdateState>>,
+    laya_status: Arc<Mutex<crate::laya::Status>>,
+    speller: crate::spelling::Speller,
+    prev_draft: String,
+    spell_target: Option<crate::spelling::Word>,
+    last_side_tab: SideTab,
+    side_changed_at: Instant,
+    spinner: Spinner,
+    archived: Vec<ArchivedChat>,
+    archived_loaded: bool,
+    recent_runs: Option<(String, Instant, Vec<ledger::RunSummary>)>,
+    compacting: Option<CompactRun>,
+    /// The latest memory briefing sent: chat, tokens it takes, memories in it.
+    memory_context: Option<(String, u64, usize)>,
+    /// Fast mode: priority processing, about 1.5x speed for more usage.
+    fast_mode: bool,
+    /// The usage record as drawn on Settings > Usage, refreshed every couple of seconds.
+    usage_view: Option<(Instant, crate::usage::Usage)>,
+    archive_preview: Option<ArchivePreview>,
+    pending_archive_delete: Option<String>,
+    chrome_status: Arc<Mutex<crate::chrome_ext::Status>>,
     /// User hook scripts (PreToolUse, Stop, ...), shared with every worker thread.
     hooks: Arc<RwLock<HookRegistry>>,
     hooks_draft: String,
@@ -316,7 +424,7 @@ pub struct JarvusApp {
     agents_loaded_for: String,
 }
 
-impl Default for JarvusApp {
+impl Default for RheaApp {
     fn default() -> Self {
         let (conversations, active_conversation) = load_conversation_store();
         let mcp_path = mcp::default_config_path();
@@ -350,7 +458,7 @@ impl Default for JarvusApp {
             usage_estimate_base: 0,
             context_tokens: 0,
             last_dynamic_tool_tokens: 0,
-            context_drawer_open: false,
+            context_drawer_open: env::var("RHEA_DEMO_CONTEXT").is_ok_and(|value| !value.is_empty()),
             history_panel_width: 236.0,
             history_resize_start: 236.0,
             renaming_conversation: None,
@@ -373,7 +481,7 @@ impl Default for JarvusApp {
             review_filter_days: 0,
             review_selected: Default::default(),
             pending_chat_delete: None,
-            draft: String::new(),
+            draft: env::var("RHEA_DEMO_DRAFT").unwrap_or_default(),
             editing_turn: None,
             edit_generation: 0,
             streaming: false,
@@ -383,14 +491,34 @@ impl Default for JarvusApp {
             jev_action_started: None,
             assistant_started_at: None,
             notice: mcp_load_error.unwrap_or_else(|| {
-                "JEV is running locally. Connect ChatGPT to start a conversation.".into()
+                "Rhea is running locally. Connect ChatGPT to start a conversation.".into()
             }),
             scroll_to_bottom: true,
-            show_tools: false,
-            show_settings: false,
-            settings_section: SettingsSection::Chat,
+            show_settings: env::var("RHEA_DEMO_SETTINGS").ok().and_then(|key| SettingsSection::from_key(&key)).is_some(),
+            settings_section: env::var("RHEA_DEMO_SETTINGS").ok().and_then(|key| SettingsSection::from_key(&key)).unwrap_or(SettingsSection::Chat),
             native_frame_style_attempted: false,
             chrome_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            memory_view: Default::default(),
+            memory_job: Arc::new(Mutex::new(Default::default())),
+            chat_menu_open: env::var("RHEA_DEMO_MENU").ok().and_then(|row| row.parse().ok()),
+            update: Arc::new(Mutex::new(Default::default())),
+            laya_status: Arc::new(Mutex::new(Default::default())),
+            speller: crate::spelling::Speller::new(load_autocorrect().unwrap_or(false)),
+            prev_draft: String::new(),
+            spell_target: None,
+            last_side_tab: SideTab::History,
+            side_changed_at: Instant::now().checked_sub(Duration::from_secs(60)).unwrap_or_else(Instant::now),
+            spinner: Spinner::default(),
+            archived: Vec::new(),
+            archived_loaded: false,
+            recent_runs: None,
+            compacting: None,
+            memory_context: None,
+            fast_mode: load_fast_mode(),
+            usage_view: None,
+            archive_preview: None,
+            pending_archive_delete: None,
+            chrome_status: Arc::new(Mutex::new(Default::default())),
             hooks: Arc::new(RwLock::new(HookRegistry::load(&crate::hooks::default_path()).unwrap_or_default())),
             hooks_draft: String::new(),
             hooks_message: String::new(),
@@ -420,7 +548,7 @@ impl Default for JarvusApp {
     }
 }
 
-impl JarvusApp {
+impl RheaApp {
     fn begin(
         &mut self,
         operation: impl FnOnce(Sender<Result<CompletedOperation, String>>) + Send + 'static,
@@ -435,25 +563,96 @@ impl JarvusApp {
         self.notice = message.to_owned();
     }
 
+    /// First run of the usage record: count the tokens the chats that already exist have used, so
+    /// the lifetime total starts from what is known (usage of chats deleted earlier is gone).
+    fn backfill_usage(&self) {
+        if !crate::usage::needs_backfill() {
+            return;
+        }
+        let used = |chat: &Conversation| chat.total_usage.input_tokens.saturating_add(chat.total_usage.output_tokens);
+        let mut total: u64 = self.conversations.iter().map(used).sum();
+        for id in chat_store::archived_ids() {
+            if let Ok(Some(chat)) = chat_store::read_archived_file::<Conversation>(&id, "metadata.json") {
+                total = total.saturating_add(used(&chat));
+            }
+        }
+        crate::usage::backfill(total);
+    }
+
+    /// `RHEA_DEMO_CONTEXT=memory`: a short chat with memory in its context and a `/compact` that is
+    /// finished and one still running, for screenshots of the context panel and the transcript.
+    fn seed_demo_context(&mut self) {
+        if env::var("RHEA_DEMO_CONTEXT").as_deref() != Ok("memory") {
+            return;
+        }
+        let Some(conversation) = self.conversations.get_mut(self.active_conversation) else { return };
+        conversation.loaded = true;
+        conversation.title = "Demo".into();
+        let turn = |role: &str, content: &str| Turn { role: role.into(), content: content.into(), ..Default::default() };
+        conversation.turns = vec![
+            turn("user", "Find me games with more than 1K active players"),
+            turn("assistant", "Here are two that qualify: Game A (5,000 playing) and Game B (9,000 playing)."),
+        ];
+        conversation.notes = vec![ChatNote {
+            at_turn: 2,
+            command: "/compact".into(),
+            text: "Compacted 48.2K tokens".into(),
+            detail: "Now a 1.4K summary. The last exchange stays word for word.".into(),
+            failed: false,
+        }];
+        let id = conversation.id.clone();
+        self.memory_context = Some((id.clone(), 2_400, 7));
+        self.context_tokens = 61_000;
+        self.compacting = Some(CompactRun { chat_id: id, at_turn: 2, started: Instant::now().checked_sub(Duration::from_secs(72)).unwrap_or_else(Instant::now) });
+        // A worker that never answers, so the running clock stays up for the screenshot.
+        let (sender, receiver) = mpsc::channel();
+        std::mem::forget(sender);
+        self.pending = Some(receiver);
+    }
+
     fn initialize(&mut self) {
         if self.started {
             return;
         }
         self.started = true;
-        // taste-skill and unslop come with JARVUS: fetched once in the background on first launch.
+        self.seed_demo_context();
+        self.backfill_usage();
+        // taste-skill and unslop come with Rhea: fetched once in the background on first launch.
         thread::spawn(skills::ensure_bundled);
+        crate::spelling::warm_up();
+        crate::memory::set_enabled(memory_ui::load_memory_enabled().unwrap_or(true));
+        // Open the memory database and load its matcher now, so the first message does not wait.
+        thread::spawn(|| {
+            let _ = crate::memory::handle();
+            let _ = crate::memory::embed::active();
+        });
+        // The local model's install state, refreshed in the background (it reads the disk).
+        let laya_status = Arc::clone(&self.laya_status);
+        thread::spawn(move || loop {
+            let status = crate::laya::status();
+            if let Ok(mut slot) = laya_status.lock() {
+                *slot = status;
+            }
+            thread::sleep(Duration::from_secs(2));
+        });
         // Chrome bridge: register the native host for this user, then keep a
         // cheap liveness ping running so the UI shows real connection health.
         let alive = Arc::clone(&self.chrome_alive);
+        let chrome_status = Arc::clone(&self.chrome_status);
         thread::spawn(move || {
             let _ = browser::ensure_native_host_registered();
+            crate::chrome_ext::refresh_if_stale();
             loop {
-                alive.store(browser::extension_alive(), Ordering::Relaxed);
-                thread::sleep(Duration::from_secs(5));
+                let status = crate::chrome_ext::check();
+                alive.store(status.connected, Ordering::Relaxed);
+                if let Ok(mut slot) = chrome_status.lock() {
+                    *slot = status;
+                }
+                thread::sleep(Duration::from_secs(3));
             }
         });
         // Bring configured MCP servers up at start and keep retrying any that are down
-        // (an HTTP server may start after JARVUS). Connecting happens off the manager lock.
+        // (an HTTP server may start after Rhea). Connecting happens off the manager lock.
         let mcp_manager = Arc::clone(&self.mcp_manager);
         thread::spawn(move || loop {
             let wanted = mcp_manager.lock().map(|manager| manager.disconnected_enabled()).unwrap_or_default();
@@ -481,7 +680,7 @@ impl JarvusApp {
                     let _ = tx.send(result);
                 }
             },
-            "JEV started · checking desktop bridge and saved ChatGPT session…",
+            "Rhea started · checking desktop bridge and saved ChatGPT session…",
         );
     }
 
@@ -659,6 +858,7 @@ impl JarvusApp {
         let chat_id = self.conversations.get(self.active_conversation).map(|c| c.id.clone()).unwrap_or_default();
         let first_turn = history.is_empty() && summary.is_empty();
         let compose = self.compose_mode;
+        let fast_mode = self.fast_mode;
         let tool_context = tools::ToolContext {
             mcp_manager: Arc::clone(&self.mcp_manager),
             chrome_alive: Arc::clone(&self.chrome_alive),
@@ -669,6 +869,7 @@ impl JarvusApp {
             model: model.clone(),
             effort: reasoning_effort.clone(),
             context_window,
+            fast: fast_mode,
             compose,
             subagent_model: self.subagent_model.clone(),
             compact_percent: self.compact_percent,
@@ -698,6 +899,14 @@ impl JarvusApp {
                     ));
                 }
             }
+            // Long-term memory: record what the user said, and bring back what matters for it.
+            if crate::memory::enabled() {
+                crate::memory::observe_user(&chat_id, &prompt);
+                let note = crate::memory::briefing(&chat_id, &prompt);
+                let (tokens, count) = note.as_deref().map(crate::memory::note_stats).unwrap_or((0, 0));
+                let _ = tx.send(Ok(CompletedOperation::MemoryBriefing { chat_id: chat_id.clone(), tokens, count }));
+                extra_developer.extend(note);
+            }
             extra_developer.extend(skills::catalog_prompt(&skills::list()));
             let stop_hooks = hooks.clone();
             let stop_chat = chat_id.clone();
@@ -716,7 +925,10 @@ impl JarvusApp {
                 compact_percent,
                 state: Some(saved_state),
                 on_state: Some(Box::new(move |state| chat_store::save_model_state(&save_chat, &state))),
-                session_id: Some(format!("jarvus-{chat_id}")),
+                ledger: Some(ledger::Ledger::for_chat(&chat_id, "main")),
+                endpoint: None,
+                fast: fast_mode,
+                session_id: Some(format!("rhea-{chat_id}")),
                 inbox: Some(Box::new(move || tools::team_inbox(team::MAIN, &inbox_chat, &last_status))),
                 on_stop: Some(Box::new(move |answer| {
                     if !stop_hooks.has_hooks_for(HookEvent::Stop) {
@@ -739,14 +951,18 @@ impl JarvusApp {
                     if let Some(ms) = event.latency_ms { let _ = tx.send(Ok(CompletedOperation::ChatLatency(ms))); }
                     if let Some(usage) = event.usage { let _ = tx.send(Ok(CompletedOperation::ChatUsage(usage))); }
                     if let Some(compaction) = event.compaction { let _ = tx.send(Ok(CompletedOperation::ContextCompacted(compaction))); }
+                    if let Some(notice) = event.notice { let _ = tx.send(Ok(CompletedOperation::McpUpdated(notice))); }
                     if let Some(error) = event.error { let _ = tx.send(Err(error)); }
                 }
             ));
             match result {
-                Ok(_) => { let _ = tx.send(Ok(CompletedOperation::ChatDone)); }
+                Ok(answer) => {
+                    crate::memory::observe_turn_end(&chat_id, &prompt, &answer);
+                    let _ = tx.send(Ok(CompletedOperation::ChatDone));
+                }
                 Err(error) => { let _ = tx.send(Err(error)); }
             }
-        }, "JEV is thinking…");
+        }, "Rhea is thinking…");
     }
 
     /// Tools offered on every request beyond the built-in toolset: the Shell package.
@@ -843,8 +1059,9 @@ impl JarvusApp {
         if self.streaming {
             return;
         }
-        // Already on a fresh, empty chat: do nothing instead of piling up blank chats.
-        if self.conversations.get(self.active_conversation).is_some_and(|chat| chat.turns.is_empty()) {
+        // Already on a fresh, empty chat: nothing to do. A new chat is just the empty workspace;
+        // it only becomes a history card (and a folder on disk) once its first message is sent.
+        if self.conversations.get(self.active_conversation).is_some_and(is_blank) {
             return;
         }
         self.flush_history(true);
@@ -852,18 +1069,47 @@ impl JarvusApp {
             self.inactive_unloads
                 .insert(previous.id.clone(), Instant::now() + Duration::from_secs(5));
         }
-        self.conversations.insert(0, new_conversation());
-        self.active_conversation = 0;
+        let fresh = new_conversation();
+        let fresh_id = fresh.id.clone();
+        self.conversations.insert(0, fresh);
+        self.drop_blank_chats(&fresh_id);
         self.editing_turn = None;
         self.draft.clear();
         self.notice.clear();
         self.history_dirty = true;
         self.scroll_to_bottom = true;
         self.reset_context_for_active_chat();
-        if let Some(chat) = self.conversations.get(self.active_conversation) {
-            self.context_chat_id = chat.id.clone();
-        }
+        self.context_chat_id = fresh_id;
         self.flush_history(true);
+    }
+
+    /// Forget every chat that never got a message, except `keep_id`, and re-point the active index.
+    fn drop_blank_chats(&mut self, keep_id: &str) {
+        let doomed: Vec<String> = self.conversations.iter().filter(|chat| is_blank(chat) && chat.id != keep_id).map(|chat| chat.id.clone()).collect();
+        for id in &doomed {
+            let _ = chat_store::delete_chat(id);
+            self.inactive_unloads.remove(id);
+        }
+        self.conversations.retain(|chat| !is_blank(chat) || chat.id == keep_id);
+        self.active_conversation = self.conversations.iter().position(|chat| chat.id == keep_id).unwrap_or(0);
+        self.renaming_conversation = None;
+        self.pending_chat_delete = None;
+        self.chat_menu_open = None;
+    }
+
+    /// The context window always follows the selected model (every model in the catalog reports
+    /// its own), whichever way the model changed: the picker, a reloaded catalog or a saved choice.
+    fn sync_context_window(&mut self) {
+        if let Some(model) = self.model_list.iter().find(|model| model.slug == self.selected_model) {
+            self.context_window_reported = model.context_limit().is_some();
+            self.context_window = model.context_limit().unwrap_or(chat::DEFAULT_CONTEXT_WINDOW);
+        }
+    }
+
+    /// Tokens the latest memory briefing adds to the open chat's context (zero for another chat).
+    fn memory_tokens(&self) -> u64 {
+        let active = self.conversations.get(self.active_conversation).map(|chat| chat.id.as_str());
+        self.memory_context.as_ref().filter(|(id, _, _)| Some(id.as_str()) == active).map(|(_, tokens, _)| *tokens).unwrap_or(0)
     }
 
     /// What the main chat's own text, the system prompt and the tool list add up to locally.
@@ -876,6 +1122,7 @@ impl JarvusApp {
                 chat::estimate_context_tokens(&conversation.context_summary, &conversation.turns[start..], "")
                     .saturating_add(toolset_tokens_estimate())
                     .saturating_add(self.last_dynamic_tool_tokens)
+                    .saturating_add(self.memory_tokens())
             })
             .unwrap_or(0)
     }
@@ -908,6 +1155,7 @@ impl JarvusApp {
                 chat::estimate_context_tokens(&conversation.context_summary, &conversation.turns[start..], "")
                     .saturating_add(toolset_tokens_estimate())
                     .saturating_add(self.last_dynamic_tool_tokens)
+                    .saturating_add(self.memory_tokens())
             })
             .unwrap_or(0);
         self.context_tokens = tokens;
@@ -935,12 +1183,14 @@ impl JarvusApp {
                 .insert(previous.id.clone(), Instant::now() + Duration::from_secs(5));
         }
         self.active_conversation = index;
+        let target_id = self.conversations[index].id.clone();
         if let Some(conversation) = self.conversations.get_mut(index) {
             self.inactive_unloads.remove(&conversation.id);
             if !conversation.loaded {
                 load_conversation_body(conversation);
             }
         }
+        self.drop_blank_chats(&target_id);
         self.reset_context_for_active_chat();
         self.editing_turn = None;
         self.scroll_to_bottom = true;
@@ -971,11 +1221,15 @@ impl JarvusApp {
                     conversation.message_count = conversation.turns.len();
                     conversation.preview = conversation_preview(&conversation.turns);
                     conversation.turns.clear();
+                    conversation.notes.clear();
                     conversation.context_summary.clear();
                     conversation.summary_through = 0;
                     conversation.loaded = false;
                 }
             }
+            // The chat's transcript files stay open while it is in use; five quiet seconds after
+            // leaving it they are saved and closed.
+            chat_store::close_chat_files(&id);
             self.inactive_unloads.remove(&id);
         }
         if let Some(next) = self.inactive_unloads.values().min() {
@@ -1002,6 +1256,15 @@ impl JarvusApp {
     }
 
     fn delete_chat(&mut self, index: usize) {
+        self.remove_chat(index, false);
+    }
+
+    /// Move the chat's folder into `Archives` (see Settings > Archived chats).
+    fn archive_chat(&mut self, index: usize) {
+        self.remove_chat(index, true);
+    }
+
+    fn remove_chat(&mut self, index: usize, archive: bool) {
         if index >= self.conversations.len() || self.streaming {
             return;
         }
@@ -1012,8 +1275,15 @@ impl JarvusApp {
             .map(|conversation| conversation.id.clone());
         self.conversations.remove(index);
         self.inactive_unloads.remove(&removed_id);
-        if let Err(error) = chat_store::delete_chat(&removed_id) {
-            self.notice = format!("Could not remove chat files: {error}");
+        // Save what is in memory first so the archive holds the whole chat.
+        let result = if archive { chat_store::archive_chat(&removed_id) } else { chat_store::delete_chat(&removed_id) };
+        if let Err(error) = result {
+            if !(archive && error.kind() == std::io::ErrorKind::NotFound) {
+                self.notice = format!("Could not {} the chat: {error}", if archive { "archive" } else { "remove" });
+            }
+        } else if archive {
+            self.notice = "Chat archived. Find it in Settings > Archived chats.".into();
+            self.archived_loaded = false;
         }
         if self.conversations.is_empty() {
             let conversation = new_conversation();
@@ -1147,6 +1417,7 @@ impl JarvusApp {
                         if let Some(elapsed) = self.assistant_started_at.take().map(|started| {
                             started.elapsed().as_millis().min(u64::MAX as u128) as u64
                         }) {
+                            crate::usage::record_run(elapsed, &self.reasoning_effort, self.fast_mode);
                             if let Some(turn) = self
                                 .conversations
                                 .get_mut(self.active_conversation)
@@ -1158,7 +1429,7 @@ impl JarvusApp {
                             }
                         }
                         self.finish_empty_assistant(format!(
-                            "JEV could not finish this request: {error}"
+                            "Rhea could not finish this request: {error}"
                         ));
                         self.history_dirty = true;
                         self.streaming = false;
@@ -1199,7 +1470,8 @@ impl JarvusApp {
                     }
                     Ok(CompletedOperation::SignedIn(account)) => {
                         self.signed_in = true;
-                        self.account = account;
+                        // RHEA_DEMO keeps the signed-in address out of screenshots.
+                        self.account = if env::var_os("RHEA_DEMO").is_some() { "ChatGPT account".into() } else { account };
                         self.device_code = None;
                         self.notice = "ChatGPT connected · loading available models…".into();
                     }
@@ -1227,9 +1499,8 @@ impl JarvusApp {
                             .iter()
                             .find(|model| model.slug == self.selected_model)
                         {
-                            self.context_window_reported = model.context_window.is_some();
-                            self.context_window =
-                                model.context_window.unwrap_or(chat::DEFAULT_CONTEXT_WINDOW);
+                            self.context_window_reported = model.context_limit().is_some();
+                            self.context_window = model.context_limit().unwrap_or(chat::DEFAULT_CONTEXT_WINDOW);
                         }
                         if let Some(model) = self
                             .model_list
@@ -1261,7 +1532,7 @@ impl JarvusApp {
                             .get_mut(self.active_conversation)
                             .and_then(|c| c.turns.last_mut())
                         {
-                            last.content.push_str(&delta);
+                            last.content.push_str(&plain_dashes(&delta));
                         }
                         self.history_dirty = true;
                         self.active_tool = None;
@@ -1304,6 +1575,15 @@ impl JarvusApp {
                         self.latency_ms = Some(ms);
                     }
                     Ok(CompletedOperation::ChatUsage(usage)) => {
+                        // Lifetime usage: what this request cost and where it went.
+                        let parts = crate::usage::Parts::of_request(
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            chat::system_prompt_tokens(),
+                            toolset_tokens_estimate().saturating_add(self.last_dynamic_tool_tokens),
+                            self.memory_tokens(),
+                        );
+                        crate::usage::record_request(usage.input_tokens, usage.output_tokens, parts);
                         self.context_usage = usage.clone();
                         self.context_usage_estimated = false;
                         self.usage_estimate_base = self.main_text_estimate();
@@ -1334,21 +1614,47 @@ impl JarvusApp {
                         self.history_dirty = true;
                         force_history_save = true;
                     }
-                    Ok(CompletedOperation::Compacted(result)) => match result {
-                        Ok((summary, through)) => {
-                            if let Some(conversation) = self.conversations.get_mut(self.active_conversation) {
-                                conversation.context_summary = summary;
-                                conversation.summary_through = through.min(conversation.turns.len());
-                                // The next request's real size replaces the stale reported usage.
-                                conversation.latest_usage = None;
+                    Ok(CompletedOperation::MemoryBriefing { chat_id, tokens, count }) => {
+                        self.memory_context = Some((chat_id, tokens, count));
+                    }
+                    Ok(CompletedOperation::Compacted(result)) => {
+                        let run = self.compacting.take();
+                        let chat_id = run.as_ref().map(|run| run.chat_id.clone());
+                        let at_turn = run.as_ref().map(|run| run.at_turn).unwrap_or(usize::MAX);
+                        let target = chat_id.and_then(|id| self.conversations.iter().position(|chat| chat.id == id)).unwrap_or(self.active_conversation);
+                        let note = match result {
+                            Ok(outcome) => {
+                                if let Some(conversation) = self.conversations.get_mut(target) {
+                                    conversation.context_summary = outcome.summary;
+                                    conversation.summary_through = outcome.through.min(conversation.turns.len());
+                                    // The next request's real size replaces the stale reported usage.
+                                    conversation.latest_usage = None;
+                                }
+                                if target == self.active_conversation {
+                                    self.reset_context_for_active_chat();
+                                }
+                                self.notice = "Context compacted · older turns were summarized".into();
+                                ChatNote {
+                                    at_turn,
+                                    command: "/compact".into(),
+                                    text: format!("Compacted {} tokens", format_tokens(outcome.compacted_tokens)),
+                                    detail: format!("Now a {} summary. The last exchange stays word for word.", format_tokens(outcome.summary_tokens)),
+                                    failed: false,
+                                }
                             }
-                            self.reset_context_for_active_chat();
-                            self.notice = "Context compacted · older turns were summarized".into();
-                            self.history_dirty = true;
-                            force_history_save = true;
+                            Err(error) => {
+                                self.notice = format!("Could not compact the context: {error}");
+                                ChatNote { at_turn, command: "/compact".into(), text: "Could not compact the context".into(), detail: error, failed: true }
+                            }
+                        };
+                        if let Some(conversation) = self.conversations.get_mut(target) {
+                            let at = note.at_turn.min(conversation.turns.len());
+                            conversation.notes.push(ChatNote { at_turn: at, ..note });
                         }
-                        Err(error) => self.notice = format!("Could not compact the context: {error}"),
-                    },
+                        self.scroll_to_bottom = true;
+                        self.history_dirty = true;
+                        force_history_save = true;
+                    }
                     Ok(CompletedOperation::Apps(value)) => {
                         self.desktop_json = pretty(&value);
                         self.desktop_status = "Agent Desktop app inventory refreshed".into();
@@ -1383,6 +1689,7 @@ impl JarvusApp {
                         if let Some(elapsed) = self.assistant_started_at.take().map(|started| {
                             started.elapsed().as_millis().min(u64::MAX as u128) as u64
                         }) {
+                            crate::usage::record_run(elapsed, &self.reasoning_effort, self.fast_mode);
                             if let Some(turn) = self
                                 .conversations
                                 .get_mut(self.active_conversation)
@@ -1394,15 +1701,15 @@ impl JarvusApp {
                             }
                         }
                         let fallback = match self.active_tool.as_deref() {
-                            Some("open_app") => "JEV opened the requested app, but ChatGPT did not return a text follow-up.".to_owned(),
-                            Some("inspect_desktop") => "JEV inspected the desktop, but ChatGPT did not return a text follow-up.".to_owned(),
-                            Some("list_processes") => "JEV checked the running apps, but ChatGPT did not return a text follow-up.".to_owned(),
-                            Some(_) => "JEV completed a local step, but ChatGPT did not return a text follow-up.".to_owned(),
+                            Some("open_app") => "Rhea opened the requested app, but ChatGPT did not return a text follow-up.".to_owned(),
+                            Some("inspect_desktop") => "Rhea inspected the desktop, but ChatGPT did not return a text follow-up.".to_owned(),
+                            Some("list_processes") => "Rhea checked the running apps, but ChatGPT did not return a text follow-up.".to_owned(),
+                            Some(_) => "Rhea completed a local step, but ChatGPT did not return a text follow-up.".to_owned(),
                             None => "ChatGPT completed without a visible response. Please regenerate the reply.".to_owned(),
                         };
                         self.finish_empty_assistant(fallback);
                         self.active_tool = None;
-                        self.notice = "JEV replied · response completed".into();
+                        self.notice = "Rhea replied · response completed".into();
                         self.history_dirty = true;
                         self.scroll_to_bottom = true;
                         force_history_save = true;
@@ -1415,6 +1722,13 @@ impl JarvusApp {
         }
         if keep_pending {
             self.pending = receiver;
+        } else if let Some(run) = self.compacting.take() {
+            // The worker ended without a result (it crashed): never leave the clock running.
+            if let Some(conversation) = self.conversations.iter_mut().find(|chat| chat.id == run.chat_id) {
+                let at_turn = run.at_turn.min(conversation.turns.len());
+                conversation.notes.push(ChatNote { at_turn, command: "/compact".into(), text: "Could not compact the context".into(), detail: "The compaction stopped unexpectedly.".into(), failed: true });
+                self.history_dirty = true;
+            }
         }
         self.flush_history(force_history_save);
         self.unload_inactive_conversations(ctx);
@@ -1521,14 +1835,23 @@ impl JarvusApp {
         let start = conversation.summary_through.min(conversation.turns.len());
         let through = conversation.turns.len().saturating_sub(2).max(start);
         if through <= start {
-            self.notice = "Nothing to compact yet.".into();
+            let at_turn = conversation.turns.len();
+            self.add_note(ChatNote {
+                at_turn,
+                command: "/compact".into(),
+                text: "Nothing to compact yet.".into(),
+                detail: "Compacting summarizes everything except the last exchange, and there is nothing older than that.".into(),
+                failed: false,
+            });
             return;
         }
         let turns = conversation.turns[start..through].to_vec();
+        let at_turn = conversation.turns.len();
         let summary = conversation.context_summary.clone();
         let chat_id = conversation.id.clone();
+        let id_for_run = chat_id.clone();
         let visible_turns = conversation.turns.len() - start;
-        let session = format!("jarvus-{}", conversation.id);
+        let session = format!("rhea-{}", conversation.id);
         let model = self.selected_model.clone();
         self.begin(
             move |tx| {
@@ -1539,17 +1862,30 @@ impl JarvusApp {
                     if !state.items.is_empty() && state.turns == visible_turns {
                         let (summary, remaining, summarized) =
                             chat::compact_items(&tokens.access_token, tokens.account_id.as_deref(), &model, &summary, Some(&session), &state)?;
+                        let compacted_tokens = chat::estimate_state_tokens(&state).saturating_sub(chat::estimate_state_tokens(&remaining));
                         chat_store::save_model_state(&chat_id, &remaining);
-                        Ok((summary, start + summarized))
+                        Ok(CompactOutcome { summary_tokens: chat::estimate_text_tokens(&summary), summary, through: start + summarized, compacted_tokens })
                     } else {
+                        let compacted_tokens = chat::estimate_turn_tokens(&turns);
                         chat::compact_conversation(&tokens.access_token, tokens.account_id.as_deref(), &model, &summary, Some(&session), &turns)
-                            .map(|summary| (summary, through))
+                            .map(|summary| CompactOutcome { summary_tokens: chat::estimate_text_tokens(&summary), summary, through, compacted_tokens })
                     }
                 });
                 let _ = tx.send(Ok(CompletedOperation::Compacted(result)));
             },
             "Compacting context…",
         );
+        self.compacting = Some(CompactRun { chat_id: id_for_run, at_turn, started: Instant::now() });
+        self.scroll_to_bottom = true;
+    }
+
+    /// Show a slash command and its outcome in the open chat.
+    fn add_note(&mut self, note: ChatNote) {
+        if let Some(conversation) = self.conversations.get_mut(self.active_conversation) {
+            conversation.notes.push(note);
+        }
+        self.history_dirty = true;
+        self.scroll_to_bottom = true;
     }
 
     /// Stop the running turn now: the worker is told to quit at its next safe point and the
@@ -1565,6 +1901,7 @@ impl JarvusApp {
             .take()
             .map(|started| started.elapsed().as_millis().min(u64::MAX as u128) as u64)
         {
+            crate::usage::record_run(elapsed, &self.reasoning_effort, self.fast_mode);
             if let Some(turn) = self
                 .conversations
                 .get_mut(self.active_conversation)
@@ -1618,10 +1955,24 @@ impl JarvusApp {
         } else {
             ui.vertical(|ui| self.side_tabs(ui, &agents));
         }
+        // The incoming panel eases in (ease-out, 220 ms): it slides a few pixels from the side it
+        // belongs to while fading up, and history rows follow one after another.
+        if self.last_side_tab != self.side_tab {
+            self.last_side_tab = self.side_tab;
+            self.side_changed_at = Instant::now();
+        }
+        let since_switch = self.side_changed_at.elapsed().as_secs_f32();
+        let enter = ease_out(since_switch / PANEL_SECS);
+        if since_switch < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        let slide = (1.0 - enter) * 14.0 * if self.side_tab == SideTab::Subagents { 1.0 } else { -1.0 };
+        let remaining = ui.available_rect_before_wrap().translate(Vec2::new(slide, 0.0));
+        let mut inner = ui.new_child(UiBuilder::new().max_rect(remaining));
+        inner.set_opacity(enter);
+        let ui = &mut inner;
         if self.side_tab == SideTab::Subagents {
-            let remaining = ui.available_rect_before_wrap();
-            let mut inner = ui.new_child(UiBuilder::new().max_rect(remaining));
-            self.agents_panel(&mut inner, agents);
+            self.agents_panel(ui, agents);
             return;
         }
         ui.vertical(|ui| {
@@ -1639,7 +1990,7 @@ impl JarvusApp {
                 });
             });
             ui.label(
-                egui::RichText::new(format!("{} conversations", self.conversations.len()))
+                egui::RichText::new(format!("{} conversations", self.conversations.iter().filter(|chat| !is_blank(chat)).count()))
                     .size(11.0)
                     .color(MUTED),
             );
@@ -1651,7 +2002,15 @@ impl JarvusApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     let mut delete_index = None;
+                    let mut archive_index = None;
+                    let mut shown_rows = 0usize;
                     for index in 0..self.conversations.len() {
+                        // A new chat has no card until its first message is sent.
+                        if is_blank(&self.conversations[index]) {
+                            continue;
+                        }
+                        ui.set_opacity(enter * stagger(since_switch, shown_rows));
+                        shown_rows += 1;
                         let selected = index == self.active_conversation;
                         let title = self.conversations[index].title.clone();
                         let count = self.conversations[index]
@@ -1772,10 +2131,12 @@ impl JarvusApp {
                         // Row actions float on top of the preview, vertically centered,
                         // over a fade so the title stays legible underneath.
                         let armed = self.pending_chat_delete == Some(index);
+                        let menu_open = self.chat_menu_open == Some(index);
+                        let pin = ui.ctx().animate_bool_with_time(ui.make_persistent_id(("history-pin", index)), menu_open, 0.15);
                         let mut action_clicked = false;
-                        if hover > 0.01 || armed {
+                        if hover > 0.01 || menu_open || pin > 0.01 {
                             let strip = Rect::from_min_max(
-                                pos2(row_rect.right() - 96.0, row_rect.top()),
+                                pos2(row_rect.right() - 52.0, row_rect.top()),
                                 row_rect.max,
                             );
                             let fade = Rect::from_min_max(
@@ -1789,11 +2150,11 @@ impl JarvusApp {
                             mesh.colored_vertex(fade.left_top(), clear);
                             mesh.colored_vertex(
                                 fade.right_top(),
-                                base.gamma_multiply(hover.max(armed as u8 as f32)),
+                                base.gamma_multiply(hover.max(pin)),
                             );
                             mesh.colored_vertex(
                                 fade.right_bottom(),
-                                base.gamma_multiply(hover.max(armed as u8 as f32)),
+                                base.gamma_multiply(hover.max(pin)),
                             );
                             mesh.colored_vertex(fade.left_bottom(), clear);
                             mesh.add_triangle(0, 1, 2);
@@ -1807,80 +2168,68 @@ impl JarvusApp {
                                     ne: 11,
                                     se: 11,
                                 },
-                                base.gamma_multiply(hover.max(armed as u8 as f32)),
+                                base.gamma_multiply(hover.max(pin)),
                             );
-                            let mut x = strip.right() - 10.0;
-                            for (icon, hint) in [
-                                (
-                                    "trash",
-                                    if armed {
-                                        "Click again to delete this chat"
-                                    } else {
-                                        "Delete chat"
-                                    },
-                                ),
-                                ("edit", "Rename chat"),
-                            ] {
-                                let rect = Rect::from_center_size(
-                                    pos2(x - 14.0, row_rect.center().y),
-                                    Vec2::splat(28.0),
-                                );
-                                x -= 34.0;
-                                let button = ui.interact(
-                                    rect,
-                                    ui.make_persistent_id(("history-action", index, icon)),
-                                    Sense::click(),
-                                );
-                                let hot = button.hovered();
-                                if hot {
-                                    ui.painter().rect_filled(
-                                        rect,
-                                        CornerRadius::same(8),
-                                        if icon == "trash" && armed {
-                                            Color32::from_rgb(70, 28, 24)
-                                        } else {
-                                            HOVER_FILL
-                                        },
-                                    );
-                                }
-                                let color = if icon == "trash" && armed {
-                                    DANGER
-                                } else if hot {
-                                    HOVER_GREEN
-                                } else {
-                                    INK
-                                };
-                                paint_icon(
-                                    ui.painter(),
-                                    rect,
-                                    icon,
-                                    color.gamma_multiply(hover.max(armed as u8 as f32)),
-                                );
-                                button.widget_info(|| {
-                                    egui::WidgetInfo::labeled(egui::Role::Button, true, hint)
-                                });
-                                let clicked = button.clicked();
-                                let _ = button.on_hover_text(hint);
-                                if clicked {
-                                    action_clicked = true;
-                                    match icon {
-                                        "edit" => {
-                                            self.renaming_conversation = Some(index);
-                                            self.rename_draft = title.clone();
-                                            self.pending_chat_delete = None;
-                                        }
-                                        _ if armed => {
+                            let dots_rect = Rect::from_center_size(pos2(strip.right() - 24.0, row_rect.center().y), Vec2::splat(28.0));
+                            let dots = ui.interact(dots_rect, ui.make_persistent_id(("history-more", index)), Sense::click());
+                            let hot = ui.ctx().animate_bool_with_time(ui.make_persistent_id(("history-more-hot", index)), dots.hovered() || menu_open, 0.15);
+                            ui.painter().rect_filled(dots_rect, CornerRadius::same(8), HOVER_FILL.gamma_multiply(hot));
+                            paint_icon(ui.painter(), dots_rect, "more", lerp_color(INK, HOVER_GREEN, hot).gamma_multiply(pin.max(hover)));
+                            dots.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Chat options"));
+                            if dots.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            let mut open = menu_open;
+                            let mut close_menu = false;
+                            if dots.clicked() {
+                                open = !open;
+                                action_clicked = true;
+                            }
+                            egui::Popup::from_response(&dots)
+                                .open_bool(&mut open)
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                .align(egui::RectAlign::BOTTOM_END)
+                                .align_alternatives(&[egui::RectAlign::TOP_END])
+                                .width(176.0)
+                                .gap(4.0)
+                                .show(|menu| {
+                                    menu.add_space(2.0);
+                                    if menu_item(menu, ("chat-menu", "rename"), "edit", "Rename", false, false).clicked() {
+                                        self.renaming_conversation = Some(index);
+                                        self.rename_draft = title.clone();
+                                        self.pending_chat_delete = None;
+                                        close_menu = true;
+                                    }
+                                    if menu_item(menu, ("chat-menu", "archive"), "archive", "Archive chat", false, false).clicked() {
+                                        archive_index = Some(index);
+                                        close_menu = true;
+                                    }
+                                    let label = if armed { "Click again to delete" } else { "Delete chat" };
+                                    if menu_item(menu, ("chat-menu", "delete"), "trash", label, true, armed).clicked() {
+                                        if armed {
                                             delete_index = Some(index);
                                             self.pending_chat_delete = None;
-                                        }
-                                        _ => {
+                                            close_menu = true;
+                                        } else {
                                             self.pending_chat_delete = Some(index);
                                         }
                                     }
-                                }
+                                    menu.add_space(2.0);
+                                });
+                            if close_menu {
+                                open = false;
+                            }
+                            if !open && armed {
+                                self.pending_chat_delete = None;
+                            }
+                            if open {
+                                self.chat_menu_open = Some(index);
+                            } else if self.chat_menu_open == Some(index) {
+                                self.chat_menu_open = None;
                             }
                         }
                         if armed
+                            && !menu_open
                             && !pointer_in_row
                             && ui.input(|input| input.pointer.any_click())
                             && !action_clicked
@@ -1892,8 +2241,11 @@ impl JarvusApp {
                         }
                         ui.add_space(6.0);
                     }
+                    ui.set_opacity(1.0);
                     if let Some(index) = delete_index {
                         self.delete_chat(index);
+                    } else if let Some(index) = archive_index {
+                        self.archive_chat(index);
                     }
                 });
         });
@@ -1906,7 +2258,7 @@ impl JarvusApp {
         let available = ctx.content_rect().size();
         let modal_width = (available.x * 0.9).clamp(640.0, 1000.0);
         let modal_height = (available.y * 0.88).clamp(420.0, 700.0);
-        let modal_id = egui::Id::unique("jarvus-settings-modal");
+        let modal_id = egui::Id::unique("rhea-settings-modal");
         let response = egui::Modal::new(modal_id)
             .backdrop_color(Color32::from_black_alpha(176))
             .frame(
@@ -2046,9 +2398,9 @@ impl JarvusApp {
                     Vec2::new(nav_rect.width() - 28.0, 22.0),
                 );
                 let (dot, label) = if self.pending.is_some() {
-                    (INK, "JEV working")
+                    (INK, "Rhea working")
                 } else {
-                    (HOVER_GREEN, "JEV ready")
+                    (HOVER_GREEN, "Rhea ready")
                 };
                 ui.painter().circle_filled(
                     pos2(status_rect.left() + 5.0, status_rect.center().y),
@@ -2136,13 +2488,14 @@ impl JarvusApp {
             self.show_settings = false;
         }
         self.review_chats_modal(ctx);
+        self.archive_preview_window(ctx);
     }
 
     fn settings_section_ui(&mut self, ui: &mut egui::Ui) {
         let (title, description) = match self.settings_section {
             SettingsSection::Chat => (
                 "Chat & model",
-                "Your ChatGPT account and the model JEV plans with.",
+                "Your ChatGPT account and the model Rhea plans with.",
             ),
             SettingsSection::Usage => (
                 "Usage",
@@ -2154,17 +2507,29 @@ impl JarvusApp {
             ),
             SettingsSection::Mcp => (
                 "MCP servers",
-                "Tools from connected stdio and HTTP MCP servers are offered to JEV automatically.",
+                "Tools from connected stdio and HTTP MCP servers are offered to Rhea automatically.",
             ),
             SettingsSection::Browser => (
                 "Browser",
-                "The Chrome extension lets JEV read and act on browser tabs.",
+                "The Chrome extension lets Rhea read and act on browser tabs.",
             ),
             SettingsSection::Agents => (
                 "Agents, skills & hooks",
-                "Which model workers use, the skills JEV can load, and scripts that run around tool calls.",
+                "Which model workers use, the skills Rhea can load, and scripts that run around tool calls.",
             ),
-            SettingsSection::Storage => ("Storage", "What JARVUS keeps on this PC, and cleanup."),
+            SettingsSection::Memory => (
+                "Memory",
+                "What Rhea remembers across chats: yours to read, correct and delete.",
+            ),
+            SettingsSection::Laya => (
+                "Local model",
+                "Laya answers quick decisions on this computer, without a ChatGPT round trip.",
+            ),
+            SettingsSection::Archived => (
+                "Archived chats",
+                "Chats you archived. Preview them, restore them to your history, or delete them for good.",
+            ),
+            SettingsSection::Storage => ("Storage", "What Rhea keeps on this PC, and cleanup."),
         };
         ui.label(egui::RichText::new(title).size(20.0).strong().color(INK));
         ui.add_space(2.0);
@@ -2234,19 +2599,7 @@ impl JarvusApp {
                         .model_list
                         .iter()
                         .find(|model| model.slug == self.selected_model)
-                        .map(|model| {
-                            format!(
-                                "{} context{}",
-                                format_tokens(
-                                    model.context_window.unwrap_or(chat::DEFAULT_CONTEXT_WINDOW)
-                                ),
-                                if model.context_window.is_some() {
-                                    ""
-                                } else {
-                                    " (fallback)"
-                                }
-                            )
-                        })
+                        .map(model_limits_text)
                         .unwrap_or_else(|| "Connect ChatGPT to load models".into());
                     settings_row(ui, None, "Model and thinking", &detail, |ui| {
                         self.model_selector(ui);
@@ -2272,6 +2625,22 @@ impl JarvusApp {
                     settings_row(
                         ui,
                         None,
+                        "Automatically AutoCorrect",
+                        "Misspelled words are underlined in red as you type. With this on, each one is replaced by the first suggestion when you finish it. Retype a word to keep it (blue underline); undo a correction three times and it is never corrected again.",
+                        |ui| {
+                            let mut on = self.speller.autocorrect;
+                            if toggle_switch(ui, &mut on).changed() {
+                                self.speller.autocorrect = on;
+                                if let Err(error) = save_autocorrect(on) {
+                                    self.notice = error;
+                                }
+                            }
+                        },
+                    );
+                    row_divider(ui);
+                    settings_row(
+                        ui,
+                        None,
                         "Model list",
                         &format!("{} models available", self.model_list.len()),
                         |ui| {
@@ -2287,14 +2656,17 @@ impl JarvusApp {
                         },
                     );
                 });
+                ui.add_space(14.0);
+                self.updates_ui(ui);
             }
             SettingsSection::Usage => {
+                self.usage_totals_ui(ui);
                 let usage_kind = if self.context_usage_estimated {
                     "estimate"
                 } else {
                     "reported"
                 };
-                settings_group(ui, Some("Latest request"), |ui| {
+                settings_group(ui, Some("Latest request in this chat"), |ui| {
                     settings_row(
                         ui,
                         None,
@@ -2367,7 +2739,7 @@ impl JarvusApp {
                     settings_row(
                         ui,
                         Some(HOVER_GREEN),
-                        "JEV local action",
+                        "Rhea local action",
                         &self
                             .jev_latency_ms
                             .map(|ms| format!("{ms} ms"))
@@ -2375,6 +2747,7 @@ impl JarvusApp {
                         |_| {},
                     );
                 });
+                self.recent_runs_ui(ui);
             }
             SettingsSection::Connections => {
                 let (configs, connected) = self.mcp_snapshot();
@@ -2485,13 +2858,16 @@ impl JarvusApp {
                     let (dot, text) = if chrome_alive {
                         (
                             HOVER_GREEN,
-                            "Extension connected · JEV can use your Chrome tabs".to_owned(),
+                            "Extension connected · Rhea can use your Chrome tabs".to_owned(),
                         )
                     } else {
-                        (DANGER, "Extension not connected · open Chrome with the JARVUS extension installed".to_owned())
+                        (DANGER, "Extension not connected · open Chrome with the Rhea extension installed".to_owned())
                     };
+                    let installed = self.chrome_status.lock().map(|status| status.in_chrome()).unwrap_or(false);
+                    let text = if chrome_alive || installed { text } else { "Chrome extension not installed · install it?".to_owned() };
                     settings_row(ui, Some(dot), "Chrome extension", &text, |ui| {
-                        if action_button(ui, "globe", "Browser", false).clicked() {
+                        let label = if chrome_alive || installed { "Browser" } else { "Install" };
+                        if action_button(ui, "globe", label, !chrome_alive && !installed).clicked() {
                             self.settings_section = SettingsSection::Browser;
                         }
                     });
@@ -2515,82 +2891,10 @@ impl JarvusApp {
             }
             SettingsSection::Mcp => self.mcp_settings_ui(ui),
             SettingsSection::Agents => self.agents_settings_ui(ui),
-            SettingsSection::Browser => {
-                let relay = browser::load_relay_config();
-                settings_group(ui, Some("Chrome extension"), |ui| {
-                    match &relay {
-                        Ok(config) => settings_row(
-                            ui,
-                            Some(HOVER_GREEN),
-                            "Connected",
-                            &format!("Native host relay running · PID {}", config.pid),
-                            |ui| {
-                                if ui
-                                    .add_enabled_ui(self.pending.is_none(), |ui| {
-                                        action_button(ui, "cancel", "Disconnect", false)
-                                    })
-                                    .inner
-                                    .clicked()
-                                {
-                                    self.begin(
-                                        |tx| {
-                                            let result = browser::stop_browser_relay()
-                                                .map(|()| {
-                                                    CompletedOperation::McpUpdated(
-                                                        "Chrome extension disconnected.".into(),
-                                                    )
-                                                })
-                                                .map_err(|error| error.to_string());
-                                            let _ = tx.send(result);
-                                        },
-                                        "Disconnecting the Chrome extension…",
-                                    );
-                                }
-                                if ui
-                                    .add_enabled_ui(self.pending.is_none(), |ui| {
-                                        action_button(ui, "check", "Test", false)
-                                    })
-                                    .inner
-                                    .clicked()
-                                {
-                                    self.begin(
-                                        |tx| {
-                                            let result = browser::execute_browser_command(
-                                                "snapshot",
-                                                serde_json::json!({}),
-                                            )
-                                            .map(CompletedOperation::BrowserSnapshot)
-                                            .map_err(|error| error.to_string());
-                                            let _ = tx.send(result);
-                                        },
-                                        "Reading the active Chrome tab…",
-                                    );
-                                }
-                            },
-                        ),
-                        Err(error) => settings_row(
-                            ui,
-                            Some(DANGER),
-                            "Not connected",
-                            &short_error(&error.to_string()),
-                            |_| {},
-                        ),
-                    }
-                    row_divider(ui);
-                    settings_row(
-                        ui,
-                        None,
-                        "Extension package",
-                        &extension_package_path().display().to_string(),
-                        |ui| {
-                            if action_button(ui, "folder", "Open", false).clicked() {
-                                self.notice = open_local_path(extension_package_path());
-                            }
-                        },
-                    );
-                });
-                ui.add(egui::Label::new(egui::RichText::new("JEV acts only on tabs the extension can see, and never reads saved passwords or cookies.").size(10.5).color(MUTED)).wrap());
-            }
+            SettingsSection::Browser => self.browser_settings_ui(ui),
+            SettingsSection::Memory => self.memory_settings_ui(ui),
+            SettingsSection::Laya => self.laya_settings_ui(ui),
+            SettingsSection::Archived => self.archived_settings_ui(ui),
             SettingsSection::Storage => self.storage_settings_ui(ui),
         }
     }
@@ -2698,7 +3002,7 @@ impl JarvusApp {
             ui,
             "chrome",
             "Chrome browser bridge (built-in)",
-            "JARVUS native messaging · browser tools",
+            "Rhea native messaging · browser tools",
             relay_ok,
             None,
             browser_tool_specs()
@@ -2711,7 +3015,7 @@ impl JarvusApp {
         if configs.is_empty() {
             ui.label(
                 egui::RichText::new(
-                    "No MCP servers yet. Paste a config above, or ask JEV in chat to add one.",
+                    "No MCP servers yet. Paste a config above, or ask Rhea in chat to add one.",
                 )
                 .size(11.0)
                 .color(MUTED),
@@ -2881,7 +3185,7 @@ impl JarvusApp {
         settings_group(ui, Some("This device"), |ui| {
             ui.add_space(10.0);
             ui.label(
-                egui::RichText::new(format!("{} used by JARVUS", format_bytes(total)))
+                egui::RichText::new(format!("{} used by Rhea", format_bytes(total)))
                     .size(13.0)
                     .strong()
                     .color(INK),
@@ -2935,7 +3239,7 @@ impl JarvusApp {
             ui.add_space(6.0);
             if let Some(root) = app_data_root() {
                 ui.label(
-                    egui::RichText::new(root.display().to_string())
+                    egui::RichText::new(chat_store::tilde(&root))
                         .size(10.0)
                         .monospace()
                         .color(MUTED),
@@ -2980,7 +3284,7 @@ impl JarvusApp {
                 ui,
                 None,
                 "Local screen captures",
-                "Debug maps and screenshots JEV saved on this PC",
+                "Debug maps and screenshots Rhea saved on this PC",
                 |ui| {
                     if action_button(ui, "folder", "Open", false).clicked() {
                         self.notice = open_local_path(captures_directory());
@@ -2993,7 +3297,7 @@ impl JarvusApp {
                 None,
                 "Downloads",
                 &downloads_directory()
-                    .map(|path| path.display().to_string())
+                    .map(|path| chat_store::tilde(&path))
                     .unwrap_or_default(),
                 |ui| {
                     if let Some(path) = downloads_directory() {
@@ -3289,7 +3593,7 @@ impl JarvusApp {
         let bar_rect = ui.max_rect();
         let content_rect = bar_rect.shrink2(Vec2::new(10.0, 6.0));
         // Reserve a real lane for status chips and window controls. At the old
-        // 330 px fixed width, the live JEV timer could be clipped on common
+        // 330 px fixed width, the live Rhea timer could be clipped on common
         // desktop sizes once the account and settings controls were present.
         let right_width = 430.0_f32.min(content_rect.width() * 0.60);
         let right_rect = Rect::from_min_max(
@@ -3311,7 +3615,7 @@ impl JarvusApp {
         left.add_space(4.0);
         left.vertical(|ui| {
             ui.add_space(1.0);
-            ui.label(egui::RichText::new("JARVUS").size(15.0).strong().color(INK));
+            ui.label(egui::RichText::new("Rhea").size(15.0).strong().color(INK));
             ui.label(
                 egui::RichText::new("Desktop assistant")
                     .size(10.0)
@@ -3320,88 +3624,6 @@ impl JarvusApp {
         });
         left.add_space(20.0);
 
-        // Segmented tabs with a pill that slides between them.
-        let tabs = [("Chat", false), ("Computer", true)];
-        let tab_size = Vec2::new(92.0, 30.0);
-        let (track, _) = left.allocate_exact_size(
-            Vec2::new(tab_size.x * tabs.len() as f32 + 6.0, tab_size.y + 6.0),
-            Sense::hover(),
-        );
-        left.painter()
-            .rect_filled(track, CornerRadius::same(18), SHELL);
-        left.painter().rect_stroke(
-            track,
-            CornerRadius::same(18),
-            egui::Stroke::new(1.0, LINE),
-            egui::StrokeKind::Inside,
-        );
-        let selected_index = if self.show_tools { 1.0 } else { 0.0 };
-        let pill_index = left.ctx().animate_value_with_time(
-            left.make_persistent_id("nav-pill"),
-            selected_index,
-            ANIM,
-        );
-        let pill = Rect::from_min_size(
-            pos2(
-                track.left() + 3.0 + pill_index * tab_size.x,
-                track.top() + 3.0,
-            ),
-            tab_size,
-        );
-        let pill_glow = egui::Shadow {
-            offset: [0, 0],
-            blur: 16,
-            spread: 0,
-            color: Color32::from_rgba_unmultiplied(GLOW_GREEN[0], GLOW_GREEN[1], GLOW_GREEN[2], 46),
-        };
-        left.painter()
-            .add(pill_glow.as_shape(pill, CornerRadius::same(15)));
-        left.painter()
-            .rect_filled(pill, CornerRadius::same(15), MINT);
-        left.painter().rect_stroke(
-            pill,
-            CornerRadius::same(15),
-            egui::Stroke::new(1.0, Color32::from_rgb(56, 60, 58)),
-            egui::StrokeKind::Inside,
-        );
-        for (index, (label, is_tools)) in tabs.iter().enumerate() {
-            let rect = Rect::from_min_size(
-                pos2(
-                    track.left() + 3.0 + index as f32 * tab_size.x,
-                    track.top() + 3.0,
-                ),
-                tab_size,
-            );
-            let response = left.interact(
-                rect,
-                left.make_persistent_id(("nav-tab", index)),
-                Sense::click(),
-            );
-            let active = self.show_tools == *is_tools;
-            let color = if active {
-                INK
-            } else if response.hovered() {
-                HOVER_GREEN
-            } else {
-                MUTED
-            };
-            left.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                *label,
-                egui::FontId::proportional(12.5),
-                color,
-            );
-            response.widget_info(|| {
-                egui::WidgetInfo::selected(egui::Role::Button, true, active, *label)
-            });
-            if response.clicked() {
-                self.show_tools = *is_tools;
-            }
-            if response.hovered() {
-                left.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-        }
         let drag_width = left.available_width().max(0.0);
         let (_, drag) =
             left.allocate_exact_size(Vec2::new(drag_width, 34.0), Sense::click_and_drag());
@@ -3427,7 +3649,7 @@ impl JarvusApp {
                 .max_rect(right_rect),
         );
         for (kind, command, hint) in [
-            ("close", egui::ViewportCommand::Close, "Close JARVUS"),
+            ("close", egui::ViewportCommand::Close, "Close Rhea"),
             (
                 "maximize",
                 egui::ViewportCommand::Maximized(!maximized),
@@ -3534,7 +3756,7 @@ impl JarvusApp {
         }
         right.add_space(6.0);
 
-        // Status chips: ChatGPT connection (dot) and JEV's own local action time.
+        // Status chips: ChatGPT connection (dot) and Rhea's own local action time.
         let (state_color, state_text) = if self.signed_in && !self.model_list.is_empty() {
             // Keep the account identifier in Settings only; the always-visible
             // titlebar state communicates connectivity without exposing the
@@ -3562,7 +3784,7 @@ impl JarvusApp {
             "jev-chip",
             |painter, rect, color| paint_icon(painter, rect, "bolt", color),
             &jev_label,
-            "JEV response time · local desktop actions only (ChatGPT time excluded)",
+            "Rhea response time · local desktop actions only (ChatGPT time excluded)",
         );
         right.add_space(6.0);
         status_chip(
@@ -3584,6 +3806,8 @@ impl JarvusApp {
             .map(|c| c.id.clone())
             .unwrap_or_else(|| "missing-conversation".into());
         let compacted_through = conversation.filter(|c| !c.context_summary.is_empty()).map(|c| c.summary_through);
+        let notes = conversation.map(|c| c.notes.clone()).unwrap_or_default();
+        let live = self.compacting.as_ref().filter(|run| run.chat_id == transcript_id).map(|run| (run.at_turn, run.started));
         ui.vertical(|ui| {
             let panel_width = ui.available_width();
             ui.add_space(2.0);
@@ -3592,6 +3816,12 @@ impl JarvusApp {
             // stick_to_bottom also bottom-aligns sparse chats after docking.
             egui::ScrollArea::vertical().id_salt(("chat-transcript", transcript_id.clone())).auto_shrink([false, false]).show(ui, |ui| {
                 for (index, turn) in turns.iter().enumerate() {
+                    for (position, note) in notes.iter().enumerate().filter(|(_, note)| note.at_turn == index) {
+                        self.command_note(ui, position, note, None);
+                    }
+                    if let Some((_, started)) = live.filter(|(at, _)| *at == index) {
+                        self.command_note(ui, usize::MAX, &ChatNote { command: "/compact".into(), ..Default::default() }, Some(started));
+                    }
                     if compacted_through == Some(index) && index > 0 {
                         ui.add_space(10.0);
                         ui.vertical_centered(|ui| {
@@ -3654,6 +3884,12 @@ impl JarvusApp {
                         let last_turn = index + 1 == turns.len();
                         self.assistant_message(ui, index, turn, last_turn, panel_width);
                     }
+                }
+                for (position, note) in notes.iter().enumerate().filter(|(_, note)| note.at_turn >= turns.len()) {
+                    self.command_note(ui, position, note, None);
+                }
+                if let Some((_, started)) = live.filter(|(at, _)| *at >= turns.len()) {
+                    self.command_note(ui, usize::MAX, &ChatNote { command: "/compact".into(), ..Default::default() }, Some(started));
                 }
                 self.queued_bubbles(ui, &transcript_id);
                 if self.scroll_to_bottom { ui.scroll_to_cursor(Some(egui::Align::BOTTOM)); self.scroll_to_bottom = false; }
@@ -3721,42 +3957,66 @@ impl JarvusApp {
                 // limit the text scrolls inside it.
                 let text_height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + self.composer_extra;
                 let enabled = self.signed_in;
-                let input = egui::ScrollArea::vertical().id_salt("composer-text").max_height(text_height).min_scrolled_height(text_height)
+                let speller = &self.speller;
+                let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| spell_galley(ui, text.as_str(), wrap_width, speller);
+                let edit = egui::ScrollArea::vertical().id_salt("composer-text").max_height(text_height).min_scrolled_height(text_height)
                     .auto_shrink([false, false]).show(ui, |ui| {
-                        ui.add_enabled(enabled,
+                        ui.add_enabled_ui(enabled, |ui| {
                             egui::TextEdit::multiline(&mut self.draft).id(input_id)
-                                .hint_text(egui::RichText::new(if !self.signed_in { "Connect ChatGPT to start a conversation" } else if self.streaming { "Queue a message · it sends when JEV finishes" } else { "Message JEV" }).color(INK))
-                                .desired_rows(2).desired_width(f32::INFINITY).font(egui::TextStyle::Body).frame(egui::Frame::NONE))
+                                .hint_text(egui::RichText::new(if !self.signed_in { "Connect ChatGPT to start a conversation" } else if self.streaming { "Queue a message · it sends when Rhea finishes" } else { "Message Rhea" }).color(INK))
+                                .desired_rows(2).desired_width(f32::INFINITY).font(egui::TextStyle::Body).frame(egui::Frame::NONE)
+                                .layouter(&mut layouter)
+                                .show(ui)
+                        }).inner
                     }).inner;
+                let input = edit.response.clone();
+                // Right-click a word: spelling suggestions.
+                if input.secondary_clicked() {
+                    self.spell_target = ui.input(|state| state.pointer.interact_pos()).and_then(|pos| {
+                        let at: usize = edit.galley.cursor_from_pos(pos - edit.galley_pos).index.into();
+                        crate::spelling::words(&self.draft).into_iter().find(|word| word.range.start <= at && at <= word.range.end)
+                    });
+                }
+                input.context_menu(|menu| self.spelling_menu(menu));
+                // Autocorrect the word that was just finished; keep the box in step with the text.
+                if input.changed() {
+                    let cursor = egui::TextEdit::load_state(ui.ctx(), input_id).and_then(|state| state.cursor.char_range()).map(|range| -> usize { range.primary.index.into() });
+                    if let Some((cursor, word)) = cursor.and_then(|cursor| crate::spelling::finished_word(&self.prev_draft, &self.draft, cursor).map(|word| (cursor, word))) {
+                        if let Some(fixed) = self.speller.word_finished(&word.text) {
+                            let moved = fixed.chars().count() as isize - word.range.len() as isize;
+                            self.draft = crate::spelling::replace_range(&self.draft, word.range.clone(), &fixed);
+                            let mut state = egui::TextEdit::load_state(ui.ctx(), input_id).unwrap_or_default();
+                            let end = (cursor as isize + moved).max(0) as usize;
+                            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(end))));
+                            state.store(ui.ctx(), input_id);
+                        }
+                    }
+                }
+                if self.draft.is_empty() && !self.prev_draft.is_empty() {
+                    self.speller.message_sent();
+                }
+                if self.prev_draft != self.draft {
+                    self.prev_draft.clone_from(&self.draft);
+                }
                 ui.add_space(4.0);
                 let mut send_clicked = false;
                 let mut queue_clicked = false;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.streaming {
-                        // Keep a visible animated running state, with a real stop
-                        // glyph on hover so cancellation is discoverable.
-                        let (rect, response) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
-                        let hovered = response.hovered();
-                        ui.painter().circle_filled(rect.center(), 20.0, if hovered { Color32::from_rgb(60, 30, 30) } else { Color32::from_rgb(18, 20, 19) });
-                        if hovered {
-                            paint_icon(ui.painter(), rect.shrink(9.0), "stop", DANGER);
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                        } else {
-                            let t = ui.input(|i| i.time) as f32;
-                            let points = (0..=24).map(|i| {
-                                let a = t * 6.0 + i as f32 / 24.0 * std::f32::consts::PI * 1.5;
-                                pos2(rect.center().x + 11.0 * a.cos(), rect.center().y + 11.0 * a.sin())
-                            }).collect::<Vec<_>>();
-                            ui.painter().add(egui::Shape::line(points, egui::Stroke::new(2.5, MINT_DEEP)));
+                        // The ring turns while the main agent works and speeds up with every running
+                        // subagent; hovering crossfades it into a stop square.
+                        let running = team::hub().running_count(&self.active_chat_id());
+                        let dt = ui.input(|input| input.stable_dt);
+                        self.spinner.step(running, dt);
+                        ui.ctx().request_repaint();
+                        if orb(ui, "stop", true, true, self.spinner.phase, "Stop this run").clicked() {
+                            self.cancel_run();
                         }
-                        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Stop this run"));
-                        if response.on_hover_text("Stop this run").clicked() { self.cancel_run(); }
                         if !self.draft.trim().is_empty() {
-                            queue_clicked = ui.add(send_button("↑")).on_hover_text("Queue this message · Enter").clicked();
+                            queue_clicked = orb(ui, "queue", false, true, 0.0, "Queue this message · Enter").clicked();
                         }
                     } else {
-                        send_clicked = ui.add_enabled(self.signed_in && self.pending.is_none() && !self.draft.trim().is_empty(), send_button("↑"))
-                            .on_hover_text("Send message · Enter · Shift+Enter for a new line").clicked();
+                        send_clicked = orb(ui, "send", false, self.signed_in && self.pending.is_none() && !self.draft.trim().is_empty(), 0.0, "Send message · Enter · Shift+Enter for a new line").clicked();
                     }
                     let context = self.context_meter(ui);
                     if context.clicked() { self.context_drawer_open = !self.context_drawer_open; }
@@ -3817,7 +4077,7 @@ impl JarvusApp {
             for config in manager.configs().iter().filter(|config| config.enabled) {
                 entries.push(SlashEntry {
                     insert: format!("Use the {} MCP server to ", config.id),
-                    hint: format!("Ask JEV to use the {} MCP server", config.id),
+                    hint: format!("Ask Rhea to use the {} MCP server", config.id),
                     name: config.id.clone(),
                     kind: "MCP",
                     runs: false,
@@ -3887,7 +4147,12 @@ impl JarvusApp {
         let animated_used = ui
             .ctx()
             .animate_value_with_time(ui.make_persistent_id("context-meter-used"), used as f32, duration);
-        let ratio = (animated_used / limit as f32).clamp(0.0, 1.0);
+        // The window itself eases when the model changes, so the ring and the numbers move together.
+        let limit_f = ui
+            .ctx()
+            .animate_value_with_time(ui.make_persistent_id("context-meter-limit"), limit as f32, if self.context_snap_frames > 0 { 0.0 } else { LIMIT_ANIM })
+            .max(1.0);
+        let ratio = (animated_used / limit_f).clamp(0.0, 1.0);
         let center = rect.center();
         let radius = 13.0;
         ui.painter().circle_stroke(
@@ -3922,7 +4187,7 @@ impl JarvusApp {
         response.on_hover_text(format!(
             "{} / {} used{}",
             format_tokens(used),
-            format_tokens(limit),
+            format_tokens(limit_f.round() as u64),
             " · current chat context estimate"
         ))
     }
@@ -3999,6 +4264,7 @@ impl JarvusApp {
         let list_open_id = ui.make_persistent_id("model-list-open");
         let mut model_choice: Option<String> = None;
         let mut effort_changed = false;
+        let mut fast_toggled = false;
         egui::Popup::from_toggle_button_response(&button)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             // Always open upward from the chip (the box sits at the bottom or middle of the window);
@@ -4119,6 +4385,11 @@ impl JarvusApp {
                             .strong()
                             .color(INK),
                         );
+                        ui.add_space(6.0);
+                        if fast_bolt(ui, self.fast_mode).clicked() {
+                            self.fast_mode = !self.fast_mode;
+                            fast_toggled = true;
+                        }
                     });
                 });
                 if reasoning_levels.is_empty() {
@@ -4241,15 +4512,19 @@ impl JarvusApp {
                 {
                     self.reasoning_effort = selected.supported_reasoning_levels[0].clone();
                 }
-                self.context_window_reported = selected.context_window.is_some();
-                self.context_window = selected
-                    .context_window
-                    .unwrap_or(chat::DEFAULT_CONTEXT_WINDOW);
+                self.context_window_reported = selected.context_limit().is_some();
+                self.context_window = selected.context_limit().unwrap_or(chat::DEFAULT_CONTEXT_WINDOW);
             }
             effort_changed = true;
         }
         if effort_changed {
             if let Err(error) = save_selected_model(&self.selected_model, &self.reasoning_effort) {
+                self.notice = error;
+            }
+        }
+        if fast_toggled {
+            self.notice = if self.fast_mode { "Fast mode on: about 1.5x speed, uses more of your plan.".into() } else { "Fast mode off.".into() };
+            if let Err(error) = save_fast_mode(self.fast_mode) {
                 self.notice = error;
             }
         }
@@ -4284,12 +4559,26 @@ impl JarvusApp {
         // into `context_tokens` every frame (see `sync_main_context`).
         let reported_context = latest_usage.as_ref().map(|u| u.input_tokens.saturating_add(u.output_tokens)).unwrap_or(0);
         let estimate = if agent.is_some() && reported_context > 0 { reported_context } else { estimate };
-        let limit = self.context_window.max(1);
+        // A subagent may run a different model than the chat, with its own window.
+        let limit = agent
+            .as_ref()
+            .and_then(|agent| self.model_list.iter().find(|model| model.slug == agent.model))
+            .and_then(|model| model.context_limit())
+            .unwrap_or(self.context_window)
+            .max(1);
         let used = estimate.min(limit);
         let system_target = chat::system_prompt_tokens().min(used);
         let tool_target = toolset_tokens_estimate()
             .saturating_add(dynamic_tool_tokens)
             .min(used.saturating_sub(system_target));
+        // What memory added to the latest request (the main chat only; an agent has none).
+        let (memory_raw, memory_count) = if agent.is_some() {
+            (0, 0)
+        } else {
+            let active = self.active_chat_id();
+            self.memory_context.as_ref().filter(|(id, _, _)| *id == active).map(|(_, tokens, count)| (*tokens, *count)).unwrap_or((0, 0))
+        };
+        let memory_target = memory_raw.min(used.saturating_sub(system_target).saturating_sub(tool_target));
         // Every number and arc eases to its new value; a chat switch snaps them first.
         let duration = if self.context_snap_frames > 0 { 0.0 } else { ANIM };
         let ease = |name: &str, value: u64| {
@@ -4298,10 +4587,18 @@ impl JarvusApp {
         let used_f = ease("used", used);
         let system_f = ease("system", system_target);
         let tool_f = ease("tools", tool_target);
-        let ratio = (used_f / limit as f32).clamp(0.0, 1.0);
+        let memory_f = ease("memory", memory_target);
+        let limit_f = ui
+            .ctx()
+            .animate_value_with_time(ui.make_persistent_id(("context-panel", "limit")), limit as f32, if self.context_snap_frames > 0 { 0.0 } else { LIMIT_ANIM })
+            .max(1.0);
+        let limit_shown = limit_f.round() as u64;
+        let ratio = (used_f / limit_f).clamp(0.0, 1.0);
         let system_tokens = system_f.round() as u64;
         let tool_tokens = tool_f.round() as u64;
-        let message_tokens = (used_f - system_f - tool_f).max(0.0).round() as u64;
+        let memory_tokens = memory_f.round() as u64;
+        let memory_percent = memory_f / limit_f * 100.0;
+        let message_tokens = (used_f - system_f - tool_f - memory_f).max(0.0).round() as u64;
         let animated_used = used_f.round() as u64;
         let heading = agent.as_ref().map(|a| format!("Context · {}", title_case(&a.name))).unwrap_or_else(|| "Context".into());
         let compact_percent = self.compact_percent;
@@ -4357,10 +4654,11 @@ impl JarvusApp {
                             ui.painter()
                                 .add(egui::Shape::line(points, egui::Stroke::new(6.0, color)));
                         };
-                        let (a, b) = (system_f / limit as f32, tool_f / limit as f32);
+                        let (a, b, m) = (system_f / limit_f, tool_f / limit_f, memory_f / limit_f);
                         arc(0.0, a, SYSTEM_PROMPT_SEGMENT);
                         arc(a, a + b, TOOLSET_SEGMENT);
-                        arc(a + b, ratio, MINT_DEEP);
+                        arc(a + b, a + b + m, MEMORY_SEGMENT);
+                        arc(a + b + m, ratio, MINT_DEEP);
                         ui.painter().text(
                             center - Vec2::new(0.0, 5.0),
                             egui::Align2::CENTER_CENTER,
@@ -4382,7 +4680,7 @@ impl JarvusApp {
                                 egui::RichText::new(format!(
                                     "{} / {}",
                                     format_tokens(animated_used),
-                                    format_tokens(limit)
+                                    format_tokens(limit_shown)
                                 ))
                                 .size(12.5)
                                 .strong()
@@ -4421,6 +4719,12 @@ impl JarvusApp {
                     );
                     context_segment_row(
                         ui,
+                        MEMORY_SEGMENT,
+                        "Memory",
+                        if memory_tokens == 0 { "—".into() } else { format!("{} · {}", format_tokens(memory_tokens), percent_text(memory_percent)) },
+                    );
+                    context_segment_row(
+                        ui,
                         MINT_DEEP,
                         "Messages & results",
                         format_tokens(message_tokens),
@@ -4429,7 +4733,7 @@ impl JarvusApp {
                         ui,
                         MINT,
                         "Free",
-                        format_tokens(limit.saturating_sub(animated_used)),
+                        format_tokens(limit_shown.saturating_sub(animated_used)),
                     );
                     ui.add_space(8.0);
                     ui.separator();
@@ -4449,12 +4753,36 @@ impl JarvusApp {
                         ui,
                         "Window",
                         if self.context_window_reported {
-                            format_tokens(limit)
+                            format_tokens(limit_shown)
                         } else {
-                            format!("{} (fallback)", format_tokens(limit))
+                            format!("{} (fallback)", format_tokens(limit_shown))
                         },
                     );
+                    let shown_model = agent
+                        .as_ref()
+                        .and_then(|agent| self.model_list.iter().find(|model| model.slug == agent.model))
+                        .or_else(|| self.model_list.iter().find(|model| model.slug == self.selected_model));
+                    if let Some(output) = shown_model.and_then(|model| model.max_output()) {
+                        context_row(ui, "Max reply", format_tokens(output));
+                    }
+                    if let Some(api) = shown_model.and_then(|model| chat::documented_limits(&model.slug)).map(|limits| limits.context).filter(|api| *api > limit_shown) {
+                        context_row(ui, "API window", format_tokens(api));
+                    }
                     context_row(ui, "Auto-compact at", format!("{compact_percent}%"));
+                    if memory_tokens > 0 {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Memory added {} to the last request ({} of the window), {} {}.",
+                                format_tokens(memory_tokens),
+                                percent_text(memory_percent),
+                                memory_count,
+                                if memory_count == 1 { "memory" } else { "memories" }
+                            ))
+                            .size(10.5)
+                            .color(MEMORY_SEGMENT),
+                        );
+                    }
                     if self.streaming && self.active_tool.as_deref() == Some("compact_context") {
                         ui.add_space(8.0);
                         ui.label(
@@ -4522,74 +4850,7 @@ impl JarvusApp {
         }
     }
 
-    fn desktop_panel(&mut self, ui: &mut egui::Ui) {
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Computer").size(21.0).strong().color(INK));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if action_button(ui, "chat", "Back to chat", false).clicked() { self.show_tools = false; }
-                });
-            });
-            ui.label(egui::RichText::new("Choose a running app or window. JEV reads its live accessibility tree before acting.").size(12.0).color(MUTED));
-            ui.add_space(14.0);
-            egui::ScrollArea::vertical().id_salt("computer-workspace").auto_shrink([false, false]).show(ui, |ui| {
-                ui.label(egui::RichText::new("App or process").size(12.0).strong().color(INK));
-                ui.add(egui::TextEdit::singleline(&mut self.target_app)
-                    .hint_text(egui::RichText::new("Discord, chrome.exe, or another app").color(INK)).desired_width(f32::INFINITY));
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("Window ID (optional)").size(12.0).strong().color(INK));
-                ui.add(egui::TextEdit::singleline(&mut self.target_window_id)
-                    .hint_text(egui::RichText::new("Leave empty to use the focused app window").color(INK)).desired_width(f32::INFINITY));
-                ui.add_space(10.0);
-                ui.horizontal_wrapped(|ui| {
-                    let enabled = self.pending.is_none();
-                    if ui.add_enabled_ui(enabled, |ui| action_button(ui, "chart", "Running apps", false)).inner.clicked() { self.refresh_apps(); }
-                    if ui.add_enabled_ui(enabled, |ui| action_button(ui, "folder", "Windows", false)).inner.clicked() { self.refresh_windows(); }
-                    if ui.add_enabled_ui(enabled && !self.target_app.trim().is_empty(), |ui| action_button(ui, "use", "Open / focus app", true)).inner.clicked() { self.launch_target(); }
-                });
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new("Snapshot target").size(12.0).strong().color(INK));
-                egui::ComboBox::from_id_salt("surface-picker").selected_text(&self.surface).width(ui.available_width()).show_ui(ui, |ui| {
-                    for surface in ["focused", "window", "menu", "menubar", "desktop", "taskbar", "start-menu"] { ui.selectable_value(&mut self.surface, surface.to_owned(), surface); }
-                });
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled_ui(self.pending.is_none(), |ui| action_button(ui, "context", "Read live controls", true)).inner.clicked() { self.snapshot(false); }
-                    if ui.add_enabled_ui(self.pending.is_none(), |ui| action_button(ui, "download", "Screenshot", false)).inner.clicked() { self.take_local_screenshot(); }
-                    if ui.add_enabled_ui(self.pending.is_none(), |ui| action_button(ui, "globe", "Build local map", false)).inner.clicked() { self.snapshot(true); }
-                });
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new("Fresh control reference").size(12.0).strong().color(INK));
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.element_ref)
-                        .hint_text(egui::RichText::new("Paste a qualified ref from the latest snapshot").color(INK)).desired_width(ui.available_width() - 110.0));
-                    if ui.add_enabled_ui(self.pending.is_none(), |ui| action_button(ui, "check", "Click ref", false)).inner.clicked() { self.click_ref(); }
-                });
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new(&self.desktop_status).size(11.0).color(MUTED));
-                if let Some(path) = &self.local_visualization {
-                    ui.label(egui::RichText::new(format!("Local UI map: {path}")).size(10.0).color(MUTED));
-                }
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("Latest Agent Desktop result").size(12.0).strong().color(INK));
-                egui::Frame::new().fill(SHELL).corner_radius(CornerRadius::same(10)).inner_margin(Margin::same(8)).show(ui, |ui| {
-                    ui.add(egui::TextEdit::multiline(&mut self.desktop_json).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(10));
-                });
-            });
-        });
-    }
-
     fn primary_workspace(&mut self, ui: &mut egui::Ui) {
-        if self.show_tools {
-            // Chat stream/tool events can request an auto-scroll while the
-            // transcript is not being rendered. Do not carry that stale
-            // request across the Computer → Chat transition; it makes the
-            // transcript jump when the Chat viewport is mounted again.
-            self.scroll_to_bottom = false;
-            self.desktop_panel(ui);
-            return;
-        }
-
         let available = ui.max_rect();
         let empty = self
             .conversations
@@ -4711,7 +4972,7 @@ impl JarvusApp {
                     .max_rect(greeting),
             );
             welcome.label(
-                egui::RichText::new("Your desktop, through JEV")
+                egui::RichText::new("Your desktop, through Rhea")
                     .size(25.0)
                     .color(INK),
             );
@@ -4740,10 +5001,21 @@ impl JarvusApp {
     }
 }
 
-impl eframe::App for JarvusApp {
+impl eframe::App for RheaApp {
+    /// Closing the window stops what Rhea started: the local model's server, and the open chat files.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::laya::stop();
+        for conversation in &self.conversations {
+            chat_store::close_chat_files(&conversation.id);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.initialize();
         self.poll(ui.ctx());
+        if let Some(error) = chat_store::take_save_error() {
+            self.notice = error;
+        }
         self.drain_queue();
         let active_chat = self.active_chat_id();
         if active_chat != self.context_chat_id {
@@ -4752,6 +5024,7 @@ impl eframe::App for JarvusApp {
                 self.reset_context_for_active_chat();
             }
         }
+        self.sync_context_window();
         self.sync_main_context();
         self.context_snap_frames = self.context_snap_frames.saturating_sub(1);
         // The transparent native client area must not inherit egui's panel outline;
@@ -4779,13 +5052,13 @@ impl eframe::App for JarvusApp {
                 ui.painter().rect_filled(shell_rect, radius, SHELL);
                 // Every decorative effect uses this shell-bounded painter. Animated
                 // panels and resized drawers can never paint into the transparent
-                // native window margin or onto the desktop behind JARVUS.
+                // native window margin or onto the desktop behind Rhea.
                 let inner = shell_rect.shrink(10.0);
                 let top_height = 48.0;
                 let top_rect = Rect::from_min_size(inner.min, Vec2::new(inner.width(), top_height));
                 let mut top = ui.new_child(
                     UiBuilder::new()
-                        .id_salt("jarvus-titlebar")
+                        .id_salt("rhea-titlebar")
                         .max_rect(top_rect),
                 );
                 self.top_bar(&mut top);
@@ -5013,20 +5286,92 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// The Chrome extension folder: bundled next to the app (`JARVUS.app/Contents/Resources` on a Mac,
-/// beside the executable elsewhere), falling back to the source checkout it was built from.
-fn extension_package_path() -> PathBuf {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from)) {
-        candidates.push(dir.join("chrome-extension"));
-        candidates.push(dir.join("../Resources/chrome-extension"));
+/// The chat box text laid out with an underline under every misspelled word: red for a word that is
+/// not in the dictionary, blue for one the user chose to keep after it was autocorrected.
+fn spell_galley(ui: &egui::Ui, text: &str, wrap_width: f32, speller: &crate::spelling::Speller) -> Arc<egui::Galley> {
+    use crate::spelling::Mark;
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let plain = egui::text::TextFormat::simple(font, ui.visuals().text_color());
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    let offsets: Vec<usize> = text.char_indices().map(|(byte, _)| byte).chain(std::iter::once(text.len())).collect();
+    let mut done = 0usize;
+    for word in crate::spelling::words(text) {
+        let mark = speller.mark(&word.text);
+        if mark == Mark::None {
+            continue;
+        }
+        job.append(&text[offsets[done]..offsets[word.range.start]], 0.0, plain.clone());
+        let mut underlined = plain.clone();
+        underlined.underline = egui::Stroke::new(1.5, if mark == Mark::Misspelled { Color32::from_rgb(232, 84, 84) } else { Color32::from_rgb(92, 154, 255) });
+        job.append(&text[offsets[word.range.start]..offsets[word.range.end]], 0.0, underlined);
+        done = word.range.end;
     }
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chrome-extension"));
-    candidates
-        .iter()
-        .find(|path| path.join("manifest.json").is_file())
-        .cloned()
-        .unwrap_or_else(|| candidates.last().cloned().unwrap_or_default())
+    job.append(&text[offsets[done]..], 0.0, plain);
+    ui.fonts_mut(|fonts| fonts.layout_job(job))
+}
+
+impl RheaApp {
+    /// The right-click menu of the chat box: suggestions for the word under the pointer.
+    fn spelling_menu(&mut self, menu: &mut egui::Ui) {
+        use crate::spelling::{self, Mark};
+        menu.set_min_width(190.0);
+        let Some(word) = self.spell_target.clone() else {
+            menu.label(egui::RichText::new("No word here").size(11.5).color(MUTED));
+            return;
+        };
+        let mut replacement: Option<String> = None;
+        if let Some(original) = self.speller.original_of(&word.text) {
+            if menu_item(menu, ("spell", "back"), "restore", &format!("Change back to “{original}”"), false, false).clicked() {
+                self.speller.keep_as_written(&original);
+                replacement = Some(spelling::match_case(&word.text, &original));
+            }
+        }
+        if self.speller.mark(&word.text) == Mark::None {
+            if replacement.is_none() {
+                menu.label(egui::RichText::new(format!("“{}” is spelled correctly", word.text)).size(11.5).color(MUTED));
+            }
+        } else {
+            let suggestions = spelling::suggestions(&word.text);
+            if suggestions.is_empty() {
+                menu.label(egui::RichText::new("No suggestions").size(11.5).color(MUTED));
+            }
+            for suggestion in &suggestions {
+                if menu_item(menu, ("spell", suggestion.as_str()), "check", suggestion, false, false).clicked() {
+                    replacement = Some(suggestion.clone());
+                }
+            }
+            menu.separator();
+            if menu_item(menu, ("spell", "add"), "plus", "Add to dictionary", false, false).clicked() {
+                self.speller.add_to_dictionary(&word.text);
+                menu.close();
+            }
+            if menu_item(menu, ("spell", "ignore"), "cancel", "Ignore for this message", false, false).clicked() {
+                self.speller.ignore_for_now(&word.text);
+                menu.close();
+            }
+        }
+        if let Some(text) = replacement {
+            self.draft = spelling::replace_range(&self.draft, word.range.clone(), &text);
+            menu.close();
+        }
+    }
+}
+
+fn load_autocorrect() -> Option<bool> {
+    settings_values()?.get("autocorrect")?.as_bool()
+}
+
+fn save_autocorrect(on: bool) -> Result<(), String> {
+    let path = settings_path().ok_or_else(|| "Could not locate your home folder.".to_owned())?;
+    let mut settings = settings_values().filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+    settings["autocorrect"] = Value::Bool(on);
+    chat_store::write_json_atomic(&path, &settings).map_err(|error| format!("Could not save the autocorrect setting: {error}"))
+}
+
+/// A chat nobody has written in yet: not shown in the history and never saved.
+fn is_blank(conversation: &Conversation) -> bool {
+    conversation.turns.is_empty() && conversation.message_count == 0
 }
 
 fn new_conversation() -> Conversation {
@@ -5075,6 +5420,7 @@ fn load_conversation_body(conversation: &mut Conversation) {
         .flatten()
         .unwrap_or_default();
     conversation.turns = history.turns;
+    conversation.notes = history.notes;
     for (index, activities) in calls.per_turn.iter().enumerate() {
         if let Some(turn) = conversation.turns.get_mut(index) {
             turn.tool_activity = activities.clone();
@@ -5112,6 +5458,7 @@ fn load_conversation_store() -> (Vec<Conversation>, usize) {
                 conversation.title = "New chat".into();
             }
             conversation.turns.clear();
+            conversation.notes.clear();
             conversation.context_summary.clear();
             conversation.summary_through = 0;
             conversation.loaded = false;
@@ -5157,6 +5504,7 @@ fn load_conversation_store() -> (Vec<Conversation>, usize) {
                 for (index, conversation) in store.conversations.iter_mut().enumerate() {
                     if index != store.active_conversation {
                         conversation.turns.clear();
+                        conversation.notes.clear();
                         conversation.context_summary.clear();
                         conversation.summary_through = 0;
                         conversation.loaded = false;
@@ -5178,6 +5526,9 @@ fn save_conversation_store(
         if !chat_store::is_valid_chat_id(&conversation.id) {
             return Err("A chat has an invalid local ID and was not saved.".into());
         }
+        if is_blank(conversation) {
+            continue;
+        }
         if conversation.loaded {
             conversation.message_count = conversation.turns.len();
             conversation.preview = conversation_preview(&conversation.turns);
@@ -5190,6 +5541,7 @@ fn save_conversation_store(
                 turn.tool_activity.clear();
             }
             let history = StoredHistory {
+                notes: conversation.notes.clone(),
                 turns,
                 context_summary: conversation.context_summary.clone(),
                 summary_through: conversation.summary_through.min(conversation.turns.len()),
@@ -5205,6 +5557,7 @@ fn save_conversation_store(
         }
         let mut metadata = conversation.clone();
         metadata.turns.clear();
+        metadata.notes.clear();
         metadata.context_summary.clear();
         metadata.summary_through = 0;
         metadata.loaded = false;
@@ -5256,6 +5609,17 @@ fn save_compact_percent(percent: u8) -> Result<(), String> {
     chat_store::write_json_atomic(&path, &settings).map_err(|error| format!("Could not save the auto-compact setting: {error}"))
 }
 
+fn load_fast_mode() -> bool {
+    settings_values().and_then(|settings| settings.get("fast_mode")?.as_bool()).unwrap_or(false)
+}
+
+fn save_fast_mode(on: bool) -> Result<(), String> {
+    let path = settings_path().ok_or_else(|| "Could not locate your home folder.".to_owned())?;
+    let mut settings = settings_values().filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+    settings["fast_mode"] = Value::Bool(on);
+    chat_store::write_json_atomic(&path, &settings).map_err(|error| format!("Could not save fast mode: {error}"))
+}
+
 fn load_reasoning_effort() -> Option<String> {
     settings_values()?
         .get("reasoning_effort")?
@@ -5291,8 +5655,12 @@ fn save_selected_model(model: &str, reasoning_effort: &str) -> Result<(), String
 }
 
 fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    if tokens >= 1_000_000_000 {
+        format!("{:.1}B", tokens as f64 / 1_000_000_000.0)
+    } else if tokens >= 1_000_000 {
+        // Two decimals so 1,050,000 reads "1.05M", without trailing zeros ("2M", "1.5M").
+        let millions = format!("{:.2}", tokens as f64 / 1_000_000.0);
+        format!("{}M", millions.trim_end_matches('0').trim_end_matches('.'))
     } else if tokens >= 10_000 {
         format!("{}K", tokens / 1_000)
     } else if tokens >= 1_000 {
@@ -5427,22 +5795,15 @@ fn action_button_styled(
     let galley =
         ui.painter()
             .layout_no_wrap(label.to_owned(), egui::FontId::proportional(11.5), INK);
-    let (rect, response) =
+    let (full, response) =
         ui.allocate_exact_size(Vec2::new(galley.size().x + 40.0, 32.0), Sense::click());
     let enabled = ui.is_enabled();
     let hovered = response.hovered() && enabled;
-    let hover = ui
-        .ctx()
-        .animate_bool_with_time(response.id.with("hover"), hovered, 0.12);
+    let hover = hover_t(ui.ctx(), response.id, hovered);
+    let rect = scale_rect(full, if enabled { press_scale(ui.ctx(), &response) } else { 1.0 });
     let (fill, text) = match colors {
-        Some((fill, text)) => (
-            if hovered {
-                fill.gamma_multiply(1.15)
-            } else {
-                fill
-            },
-            text,
-        ),
+        // A coloured button (primary, danger) brightens toward its hover colour instead of snapping.
+        Some((fill, text)) => (lerp_color(fill, fill.gamma_multiply(1.5), hover), text),
         None => (
             lerp_color(MINT, HOVER_FILL, hover),
             lerp_color(INK, HOVER_GREEN, hover),
@@ -5589,9 +5950,61 @@ fn compose_toggle(ui: &mut egui::Ui, on: bool, enabled: bool) -> egui::Response 
     }
     response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, on, "Compose mode"));
     response.on_hover_text(if on {
-        "Compose mode is ON: JEV investigates read-only, asks questions and proposes a plan. Nothing changes until you accept it. Click to turn off."
+        "Compose mode is ON: Rhea investigates read-only, asks questions and proposes a plan. Nothing changes until you accept it. Click to turn off."
     } else {
-        "Compose mode: JEV investigates read-only, asks questions and proposes a plan before changing anything. Click to turn on."
+        "Compose mode: Rhea investigates read-only, asks questions and proposes a plan before changing anything. Click to turn on."
+    })
+}
+
+/// "872K context · 128K max reply · API allows 1.1M": what the selected model can hold and write.
+fn model_limits_text(model: &chat::Model) -> String {
+    let mut parts = vec![match model.context_limit() {
+        Some(window) => format!("{} context", format_tokens(window)),
+        None => format!("{} context (fallback)", format_tokens(chat::DEFAULT_CONTEXT_WINDOW)),
+    }];
+    if let Some(output) = model.max_output() {
+        parts.push(format!("{} max reply", format_tokens(output)));
+    }
+    if let (Some(api), Some(window)) = (chat::documented_limits(&model.slug).map(|limits| limits.context), model.context_limit()) {
+        if api > window {
+            parts.push(format!("API allows {}", format_tokens(api)));
+        }
+    }
+    parts.join(" · ")
+}
+
+/// Replies use plain dashes: an em dash becomes a normal "-".
+pub(crate) fn plain_dashes(text: &str) -> String {
+    text.replace('\u{2014}', "-")
+}
+
+/// "0.3%", or "<0.1%" for a sliver.
+fn percent_text(percent: f32) -> String {
+    if percent > 0.0 && percent < 0.1 {
+        "<0.1%".into()
+    } else if percent >= 10.0 {
+        format!("{percent:.0}%")
+    } else {
+        format!("{percent:.1}%")
+    }
+}
+
+/// The fast mode bolt: lit while on, and a tooltip saying what it does.
+fn fast_bolt(ui: &mut egui::Ui, on: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 24.0), Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(response.id.with("fast-hover"), response.hovered(), ANIM);
+    let fill = if on { lerp_color(Color32::from_rgb(35, 62, 44), Color32::from_rgb(44, 78, 56), hover) } else { lerp_color(RAISED, HOVER_FILL, hover) };
+    ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
+    ui.painter().rect_stroke(rect, CornerRadius::same(8), egui::Stroke::new(1.0, if on { HOVER_GREEN.gamma_multiply(0.7) } else { LINE }), egui::StrokeKind::Inside);
+    paint_icon(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(14.0)), "bolt", if on { MEMORY_SEGMENT } else { lerp_color(MUTED, INK, hover) });
+    if hover > 0.0 {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, if on { "Fast mode, on" } else { "Fast mode, off" }));
+    response.on_hover_ui(|ui| {
+        ui.label(egui::RichText::new(if on { "Fast mode · on" } else { "Fast mode" }).strong().color(INK));
+        ui.label(egui::RichText::new("1.5x speed").color(INK));
+        ui.label(egui::RichText::new("More usage").size(11.0).color(MUTED));
     })
 }
 
@@ -5697,7 +6110,7 @@ fn begin_window_resize(ui: &mut egui::Ui, rect: Rect) {
 }
 
 /// Windows repaints the frame and the classic caption buttons whenever the window is
-/// activated or deactivated, and keeps a 1 px edge on some builds. JARVUS paints its
+/// activated or deactivated, and keeps a 1 px edge on some builds. Rhea paints its
 /// own shell, so the native frame is never allowed to draw: activation repaints and
 /// non-client painting are swallowed, and (when not maximized) the client area is the
 /// whole window.
@@ -5727,7 +6140,7 @@ mod native_frame {
             WM_NCACTIVATE => return unsafe { DefSubclassProc(hwnd, message, wparam, -1) },
             WM_NCPAINT => return 0,
             // The whole native window is client area in both restored and maximized states.
-            // JARVUS paints the titlebar and shell; this prevents Windows from flashing its
+            // Rhea paints the titlebar and shell; this prevents Windows from flashing its
             // caption/buttons or a one-pixel frame during activation transitions.
             // Both forms must be handled. With wParam == FALSE, lParam points to a
             // RECT; returning zero keeps its full area in the client region too.
@@ -5806,7 +6219,7 @@ fn apply_native_corner_preference(frame: &eframe::Frame) -> bool {
         );
         // DWMWA_NCRENDERING_POLICY (2) = DWMNCRP_DISABLED (1): Windows 10 still
         // paints a 1 px light line along the top of borderless WS_THICKFRAME
-        // windows. JARVUS paints its own shell and shadow, so turn the
+        // windows. Rhea paints its own shell and shadow, so turn the
         // non-client rendering off entirely (resize hit-testing is unaffected).
         let nc_policy: u32 = 1;
         let _ = DwmSetWindowAttribute(
@@ -5891,17 +6304,17 @@ fn tool_label(activity: &chat::ToolActivity) -> String {
                 }).collect::<Vec<_>>().join(" → ")
             }).unwrap_or_default();
             let count = args.get("steps").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-            if steps.is_empty() { None } else { Some(format!("JEV · {steps}{}", if count > 3 { format!(" +{} more", count - 3) } else { String::new() })) }
+            if steps.is_empty() { None } else { Some(format!("Rhea · {steps}{}", if count > 3 { format!(" +{} more", count - 3) } else { String::new() })) }
         }
         "open_app" | "desktop_launch" => text("app").map(|app| format!("Opening {app}")),
         "message_received" => Some(format!("Message from {}", text("from").unwrap_or("an agent"))),
-        "mcp__jarvus_shell__run_command" => Some("Running command".to_owned()),
-        "mcp__jarvus_shell__read_file" => file("path").map(|f| format!("Reading {f}")),
-        "mcp__jarvus_shell__write_file" => file("path").map(|f| format!("Writing {f}")),
-        "mcp__jarvus_shell__edit_file" => file("path").map(|f| format!("Editing {f}")),
-        "mcp__jarvus_shell__list_directory" => file("path").map(|f| format!("Listing {f}")),
-        "mcp__jarvus_shell__create_directory" => file("path").map(|f| format!("Creating folder {f}")),
-        "mcp__jarvus_shell__web_fetch" => host("url").map(|h| format!("Fetching {h}")),
+        "mcp__rhea_shell__run_command" => Some("Running command".to_owned()),
+        "mcp__rhea_shell__read_file" => file("path").map(|f| format!("Reading {f}")),
+        "mcp__rhea_shell__write_file" => file("path").map(|f| format!("Writing {f}")),
+        "mcp__rhea_shell__edit_file" => file("path").map(|f| format!("Editing {f}")),
+        "mcp__rhea_shell__list_directory" => file("path").map(|f| format!("Listing {f}")),
+        "mcp__rhea_shell__create_directory" => file("path").map(|f| format!("Creating folder {f}")),
+        "mcp__rhea_shell__web_fetch" => host("url").map(|h| format!("Fetching {h}")),
         "browser__open" => host("url").map(|h| format!("Opening {h} in Chrome")),
         "browser__navigate" => host("url").map(|h| format!("Going to {h}")),
         "browser__click" => text("target").map(|t| format!("Clicking “{}” in Chrome", short(t, 30))),
@@ -5947,18 +6360,18 @@ fn tool_state_label(state: &str) -> &str {
 
 fn brand_mark(ui: &mut egui::Ui, size: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
-    let id = egui::Id::unique("jarvus-brand-icon");
+    let id = egui::Id::unique("rhea-brand-icon");
     let texture = ui
         .ctx()
         .data(|data| data.get_temp::<egui::TextureHandle>(id));
     let texture = texture.unwrap_or_else(|| {
-        let image = image::load_from_memory(include_bytes!("../assets/jarvus-mark.png"))
-            .expect("embedded JARVUS icon PNG")
+        let image = image::load_from_memory(include_bytes!("../assets/rhea-mark.png"))
+            .expect("embedded Rhea icon PNG")
             .into_rgba8();
         let size_px = [image.width() as usize, image.height() as usize];
         let color_image = egui::ColorImage::from_rgba_unmultiplied(size_px, image.as_raw());
         let texture = ui.ctx().load_texture(
-            "jarvus-brand-icon",
+            "rhea-brand-icon",
             color_image,
             egui::TextureOptions::LINEAR,
         );
@@ -6026,12 +6439,12 @@ fn status_chip(
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: &str, hint: &str, size: f32) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let (full, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let hovered = response.hovered() || response.has_focus();
-    if hovered {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(9), HOVER_FILL);
-    }
+    let hover = hover_t(ui.ctx(), response.id, hovered);
+    let rect = scale_rect(full, press_scale(ui.ctx(), &response));
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(9), HOVER_FILL.gamma_multiply(hover));
     if hovered {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -6039,7 +6452,7 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, hint: &str, size: f32) -> egui::Re
         ui.painter(),
         rect,
         icon,
-        if hovered { HOVER_GREEN } else { INK },
+        lerp_color(INK, HOVER_GREEN, hover),
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, hint));
     response.on_hover_text(hint)
@@ -6078,16 +6491,44 @@ fn paint_icon(painter: &egui::Painter, rect: Rect, icon: &str, color: Color32) {
         "back" => ph::ARROW_LEFT,
         "agents" => ph::USERS_THREE,
         "stop" => ph::STOP,
+        "archive" => ph::ARCHIVE,
+        "up" => ph::ARROW_UP,
+        "restore" => ph::ARROW_COUNTER_CLOCKWISE,
+        "eye" => ph::EYE,
         _ => ph::CIRCLE,
     };
     let size = rect.width().min(rect.height()) * 0.62;
+    // Icons use the Phosphor family by name rather than relying on the fallback order of the
+    // proportional fonts, which differs between platforms (macOS has no Segoe UI in front of it)
+    // and left some icons blank there.
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         glyph,
-        egui::FontId::proportional(size.max(12.0)),
+        egui::FontId::new(size.max(12.0), egui::FontFamily::Name("phosphor".into())),
         color,
     );
+}
+
+/// One row of a small popup menu: icon and label, a hover fill that fades in and out, and for a
+/// dangerous item a red that eases in on hover and stays once the item is armed.
+fn menu_item(ui: &mut egui::Ui, id: (&str, &str), icon: &str, label: &str, danger: bool, armed: bool) -> egui::Response {
+    let (full, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+    let rect = scale_rect(full, press_scale(ui.ctx(), &response));
+    let id = ui.make_persistent_id(id);
+    let hot = hover_t(ui.ctx(), id, response.hovered());
+    let alarm = ui.ctx().animate_bool_with_time(id.with("alarm"), armed, 0.2);
+    let tint = if danger { lerp_color(HOVER_FILL, Color32::from_rgb(70, 28, 24), alarm.max(hot * 0.55)) } else { HOVER_FILL };
+    let fill_strength = if danger { hot.max(alarm) } else { hot };
+    ui.painter().rect_filled(rect, CornerRadius::same(8), tint.gamma_multiply(fill_strength));
+    let ink = if danger { lerp_color(INK, DANGER, alarm.max(hot * 0.7)) } else { lerp_color(INK, HOVER_GREEN, hot) };
+    paint_icon(ui.painter(), Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), Vec2::splat(24.0)), icon, ink);
+    ui.painter().text(pos2(rect.left() + 36.0, rect.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(12.5), ink);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    response
 }
 
 /// Depth under a panel: a wide, faint ambient shadow plus a tighter contact
@@ -6306,9 +6747,9 @@ pub(crate) fn browser_tool_specs() -> Vec<(String, String, Value)> {
         ("browser__back".into(), "Go back in a tab's history.".into(), tab_only(json!({}))),
         ("browser__snapshot".into(), "Read a tab fast: url, title, visible text excerpt, and interactive controls with ids. Pass target to rank controls matching it first.".into(),
             tab_only(json!({"target":{"type":"string"},"limit":{"type":"integer"},"max_chars":{"type":"integer"}}))),
-        ("browser__click".into(), "Click an element (real mouse-event sequence). JARVUS independently asks the user to approve consequential controls such as Send, Delete, or Purchase; wait for that approval and never try to bypass it. Set double or right for those clicks.".into(),
+        ("browser__click".into(), "Click an element (real mouse-event sequence). Rhea independently asks the user to approve consequential controls such as Send, Delete, or Purchase; wait for that approval and never try to bypass it. Set double or right for those clicks.".into(),
             merge(json!({"double":{"type":"boolean"},"right":{"type":"boolean"}}))),
-        ("browser__type".into(), "Type into a text field (works with React and rich editors). clear defaults to true. submit=true presses Enter / submits the form; consequential submissions may pause for the user's JARVUS approval.".into(),
+        ("browser__type".into(), "Type into a text field (works with React and rich editors). clear defaults to true. submit=true presses Enter / submits the form; consequential submissions may pause for the user's Rhea approval.".into(),
             merge(json!({"text":{"type":"string"},"clear":{"type":"boolean"},"submit":{"type":"boolean"}}))),
         ("browser__select".into(), "Choose an option in a dropdown (native <select> or custom). option is matched fuzzily.".into(),
             merge(json!({"option":{"type":"string"}}))),
@@ -6342,7 +6783,7 @@ pub(crate) fn browser_bridge_inventory(connected: bool) -> Value {
     serde_json::json!({
         "id": "chrome",
         "status": if connected { "connected" } else { "disconnected" },
-        "name": "JARVUS Chrome browser bridge",
+        "name": "Rhea Chrome browser bridge",
         "kind": "browser_bridge",
         "enabled": true,
         "connected": connected,
@@ -6361,7 +6802,7 @@ pub(crate) fn shell_connection_inventory() -> Value {
     serde_json::json!({
         "id": "shell",
         "status": "connected",
-        "name": "JARVUS Shell",
+        "name": "Rhea Shell",
         "kind": "local_connection",
         "enabled": true,
         "connected": true,
@@ -6466,25 +6907,40 @@ fn conversation_title(prompt: &str) -> String {
     }
 }
 
-fn send_button(label: &str) -> egui::Button<'_> {
-    egui::Button::new(
-        egui::RichText::new(label)
-            .size(12.0)
-            .strong()
-            .color(Color32::WHITE),
-    )
-    .fill(Color32::from_rgb(18, 20, 19))
-    .corner_radius(CornerRadius::same(20))
-    .min_size(Vec2::new(40.0, 40.0))
-}
-
 #[cfg(test)]
 mod ui_state_tests {
     use super::{
         SettingsSection, browser_bridge_inventory, builtin_command, chat_send_is_allowed, conversation_created_ns,
-        desktop_status_summary, is_local_desktop_tool, local_action_duration_label,
-        mcp_server_subtitle, preserve_line_breaks, shell_connection_inventory,
+        desktop_status_summary, format_tokens, plain_dashes, is_local_desktop_tool, local_action_duration_label,
+        mcp_server_subtitle, percent_text, preserve_line_breaks, shell_connection_inventory,
     };
+
+    #[test]
+    fn em_dashes_become_plain_dashes() {
+        assert_eq!(plain_dashes("one \u{2014} two\u{2014}three"), "one - two-three");
+        assert_eq!(plain_dashes("en \u{2013} dash stays"), "en \u{2013} dash stays");
+    }
+
+    #[test]
+    fn token_counts_keep_the_precision_that_matters() {
+        assert_eq!(format_tokens(19_800_000_000), "19.8B");
+        assert_eq!(format_tokens(858_200_000), "858.2M");
+        assert_eq!(format_tokens(1_050_000), "1.05M");
+        assert_eq!(format_tokens(1_000_000), "1M");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
+        assert_eq!(format_tokens(872_000), "872K");
+        assert_eq!(format_tokens(1_400), "1.4K");
+        assert_eq!(format_tokens(900), "900");
+    }
+
+    #[test]
+    fn memory_share_reads_as_a_short_percentage() {
+        assert_eq!(percent_text(0.0), "0.0%");
+        assert_eq!(percent_text(0.04), "<0.1%");
+        assert_eq!(percent_text(0.34), "0.3%");
+        assert_eq!(percent_text(2.46), "2.5%");
+        assert_eq!(percent_text(12.4), "12%");
+    }
 
     #[test]
     fn browser_bridge_inventory_is_separate_and_reports_live_health_and_tools() {
@@ -6515,7 +6971,7 @@ mod ui_state_tests {
         let shell = shell_connection_inventory();
         assert_eq!(shell["kind"], "local_connection");
         assert_eq!(shell["connected"], true);
-        assert_eq!(shell["tools"][0], "mcp__jarvus_shell__run_command");
+        assert_eq!(shell["tools"][0], "mcp__rhea_shell__run_command");
         assert!(shell["tools"].as_array().unwrap().len() >= 7);
     }
 
@@ -6582,7 +7038,7 @@ mod ui_state_tests {
         let names = SettingsSection::ALL.map(SettingsSection::title);
         let distinct = names.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(distinct.len(), names.len());
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 10);
     }
 
     #[test]

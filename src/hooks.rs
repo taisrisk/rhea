@@ -1,5 +1,5 @@
 //! User-configurable hook scripts, modelled on the agent-hook systems of Claude
-//! Code and Codex. A hook is a command that JARVUS runs when something happens
+//! Code and Codex. A hook is a command that Rhea runs when something happens
 //! (a prompt is submitted, a tool is about to run, a tool finished, a turn ends, a
 //! subagent starts or stops). The command receives a JSON description of the event
 //! on stdin and can answer with an exit code and/or a JSON object on stdout:
@@ -93,6 +93,9 @@ struct HookGroup {
     matcher: String,
     #[serde(default)]
     hooks: Vec<HookCommand>,
+    /// The skill that brought this group along; removing the skill removes the group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
 }
 
 /// Parsed, validated hook configuration. Cheap to clone and safe to share.
@@ -128,7 +131,7 @@ pub fn default_path() -> PathBuf {
         .or_else(|| env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir)
-        .join(".jarvus")
+        .join(crate::chat_store::DATA_DIR)
         .join("hooks.json")
 }
 
@@ -150,7 +153,9 @@ impl HookRegistry {
         if text.trim().is_empty() {
             return Ok(Self::empty());
         }
-        let value: Value = serde_json::from_str(text).map_err(|error| format!("Hooks JSON is invalid: {error}"))?;
+        // Matchers written for the old Shell tool names keep working.
+        let text = crate::chat_store::modernize_tool_names(text);
+        let value: Value = serde_json::from_str(&text).map_err(|error| format!("Hooks JSON is invalid: {error}"))?;
         let object = value.as_object().ok_or("Hooks JSON must be an object.")?;
         let hooks = match object.get("hooks") {
             Some(Value::Object(map)) => map,
@@ -273,6 +278,111 @@ impl HookRegistry {
     }
 }
 
+/// Bumped whenever hooks.json is changed from inside the app (a skill installed or removed), so
+/// the registry the agents use is reloaded before its next run.
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reload `shared` from disk if hooks.json was changed by this app since it was last loaded.
+pub fn refresh_shared(shared: &std::sync::RwLock<HookRegistry>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let generation = GENERATION.load(SeqCst);
+    if SEEN.swap(generation, SeqCst) != generation {
+        if let (Ok(registry), Ok(mut slot)) = (HookRegistry::load(&default_path()), shared.write()) {
+            *slot = registry;
+        }
+    }
+}
+
+impl HookRegistry {
+    /// Replace everything `source` brought with `groups`.
+    fn replace_source(&mut self, source: &str, groups: Vec<(HookEvent, HookGroup)>) {
+        self.groups.retain(|(_, group)| group.source.as_deref() != Some(source));
+        self.groups.extend(groups);
+    }
+
+    fn remove_source(&mut self, source: &str) -> usize {
+        let before = self.groups.len();
+        self.groups.retain(|(_, group)| group.source.as_deref() != Some(source));
+        before - self.groups.len()
+    }
+}
+
+/// The hooks a skill ships, in the Claude Code format (`hooks/hooks.json` or `hooks.json` inside
+/// the skill folder). Returns the groups to register and the events Rhea has no equivalent for.
+fn skill_hooks_from_json(skill: &str, dir: &Path, text: &str) -> Result<(Vec<(HookEvent, HookGroup)>, Vec<String>), String> {
+    let value: Value = serde_json::from_str(text).map_err(|error| format!("The skill's hooks file is not valid JSON: {error}"))?;
+    let events = value.get("hooks").unwrap_or(&value).as_object().ok_or("The skill's hooks file must be an object keyed by event name.")?;
+    let folder = dir.display().to_string();
+    let mut groups = Vec::new();
+    let mut skipped = Vec::new();
+    for (name, entries) in events {
+        let Some(event) = HookEvent::from_str(name) else {
+            skipped.push(name.clone());
+            continue;
+        };
+        for entry in entries.as_array().into_iter().flatten() {
+            let mut group: HookGroup = serde_json::from_value(entry.clone()).map_err(|error| format!("Bad hook group under '{name}': {error}"))?;
+            for hook in &mut group.hooks {
+                if hook.kind != "command" || hook.command.trim().is_empty() || hook.command.chars().count() > MAX_COMMAND_CHARS {
+                    return Err(format!("A hook under '{name}' is not a usable command hook."));
+                }
+                for variable in ["${CLAUDE_PLUGIN_ROOT}", "${CLAUDE_SKILL_DIR}", "${SKILL_DIR}", "${RHEA_SKILL_DIR}"] {
+                    hook.command = hook.command.replace(variable, &folder);
+                }
+            }
+            group.matcher = group.matcher.trim().to_owned();
+            group.source = Some(skill.to_owned());
+            if !group.hooks.is_empty() {
+                groups.push((event, group));
+            }
+        }
+    }
+    Ok((groups, skipped))
+}
+
+fn skill_hooks_file(dir: &Path) -> Option<PathBuf> {
+    [dir.join("hooks").join("hooks.json"), dir.join("hooks.json")].into_iter().find(|path| path.is_file())
+}
+
+/// Register the hooks that come with a freshly installed skill. Returns one line per hook that was
+/// installed (for the install report) and notes about anything that could not be.
+pub fn install_skill_hooks_at(registry_path: &Path, skill: &str, dir: &Path) -> Result<Vec<String>, String> {
+    let Some(file) = skill_hooks_file(dir) else { return Ok(Vec::new()) };
+    let text = fs::read_to_string(&file).map_err(|error| format!("Could not read {}: {error}", file.display()))?;
+    let (groups, skipped) = skill_hooks_from_json(skill, dir, &text)?;
+    let mut registry = HookRegistry::load(registry_path)?;
+    let mut lines: Vec<String> = groups
+        .iter()
+        .flat_map(|(event, group)| group.hooks.iter().map(move |hook| format!("{} {}: {}", event.as_str(), if group.matcher.is_empty() { "*" } else { &group.matcher }, hook.command.chars().take(120).collect::<String>())))
+        .collect();
+    registry.replace_source(skill, groups);
+    if registry.count() > MAX_HOOKS {
+        return Err(format!("Installing this skill's hooks would pass the limit of {MAX_HOOKS} hook commands."));
+    }
+    registry.save(registry_path)?;
+    if !skipped.is_empty() {
+        lines.push(format!("Not installed (Rhea has no such event): {}", skipped.join(", ")));
+    }
+    Ok(lines)
+}
+
+pub fn install_skill_hooks(skill: &str, dir: &Path) -> Result<Vec<String>, String> {
+    let lines = install_skill_hooks_at(&default_path(), skill, dir)?;
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(lines)
+}
+
+/// Drop the hooks a removed skill brought.
+pub fn remove_skill_hooks(skill: &str) {
+    let path = default_path();
+    if let Ok(mut registry) = HookRegistry::load(&path) {
+        if registry.remove_source(skill) > 0 && registry.save(&path).is_ok() {
+            GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 /// `*` and empty match everything; otherwise `|`-separated names, `*` is a wildcard.
 pub fn matcher_matches(matcher: &str, name: &str) -> bool {
     let matcher = matcher.trim();
@@ -323,7 +433,7 @@ fn run_command(command: &str, stdin_text: &str, event: HookEvent, timeout: Durat
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("JARVUS_HOOK_EVENT", event.as_str());
+        .env("RHEA_HOOK_EVENT", event.as_str());
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -501,9 +611,9 @@ mod tests {
     fn matchers_support_globs_and_alternation() {
         assert!(matcher_matches("", "anything"));
         assert!(matcher_matches("*", "anything"));
-        assert!(matcher_matches("mcp__jarvus_shell__*", "mcp__jarvus_shell__run_command"));
-        assert!(!matcher_matches("mcp__jarvus_shell__*", "browser__click"));
-        assert!(matcher_matches("browser__*|mcp__jarvus_shell__run_command", "browser__open"));
+        assert!(matcher_matches("mcp__rhea_shell__*", "mcp__rhea_shell__run_command"));
+        assert!(!matcher_matches("mcp__rhea_shell__*", "browser__click"));
+        assert!(matcher_matches("browser__*|mcp__rhea_shell__run_command", "browser__open"));
         assert!(matcher_matches("a*c", "abbbc"));
         assert!(!matcher_matches("a*c", "abbbd"));
         assert!(matcher_matches("exact", "exact"));
@@ -601,7 +711,7 @@ mod tests {
 
     #[test]
     fn save_and_load_round_trip() {
-        let dir = env::temp_dir().join(format!("jarvus-hooks-test-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("rhea-hooks-test-{}", std::process::id()));
         let path = dir.join("nested").join("hooks.json");
         let reg = registry("PostToolUse", "mcp__*", "echo done", 7);
         reg.save(&path).unwrap();
@@ -610,6 +720,39 @@ mod tests {
         reg.save(&path).unwrap(); // overwrite
         assert_eq!(HookRegistry::load(&path).unwrap(), reg);
         assert!(HookRegistry::load(&dir.join("missing.json")).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_skills_hooks_are_installed_tagged_and_replaced_on_reinstall() {
+        let dir = env::temp_dir().join(format!("rhea-skillhooks-{}", std::process::id()));
+        let skill = dir.join("skill");
+        fs::create_dir_all(skill.join("hooks")).unwrap();
+        fs::write(
+            skill.join("hooks").join("hooks.json"),
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Write|Edit","hooks":[{"type":"command","command":"node ${CLAUDE_PLUGIN_ROOT}/check.js"}]}],"Notification":[{"hooks":[{"type":"command","command":"x"}]}]}}"#,
+        )
+        .unwrap();
+        let registry_path = dir.join("hooks.json");
+        // an unrelated hook the user already had
+        registry("Stop", "", "echo mine", 5).save(&registry_path).unwrap();
+
+        let lines = install_skill_hooks_at(&registry_path, "lint", &skill).unwrap();
+        assert!(lines[0].starts_with("PostToolUse Write|Edit: node "), "{lines:?}");
+        assert!(lines[0].contains("check.js") && !lines[0].contains("${"), "{lines:?}");
+        assert!(lines.last().unwrap().contains("Notification"));
+        let loaded = HookRegistry::load(&registry_path).unwrap();
+        assert_eq!(loaded.count(), 2);
+        assert!(loaded.has_hooks_for(HookEvent::Stop) && loaded.has_hooks_for(HookEvent::PostToolUse));
+
+        install_skill_hooks_at(&registry_path, "lint", &skill).unwrap();
+        assert_eq!(HookRegistry::load(&registry_path).unwrap().count(), 2, "reinstalling does not duplicate");
+        let mut loaded = HookRegistry::load(&registry_path).unwrap();
+        assert_eq!(loaded.remove_source("lint"), 1);
+        assert_eq!(loaded.count(), 1, "the user's own hook stays");
+        let plain = dir.join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert!(install_skill_hooks_at(&registry_path, "plain", &plain).unwrap().is_empty(), "a skill without hooks changes nothing");
         let _ = fs::remove_dir_all(&dir);
     }
 

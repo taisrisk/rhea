@@ -24,13 +24,34 @@ pub fn set_run_stop_flag(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
 pub fn begin_run() {
     RUN_GENERATION.with(|run| run.set(CANCEL_GENERATION.load(Ordering::SeqCst)));
 }
-/// Ask the running chat turn and its JEV plan to stop at the next safe point.
+/// Ask the running chat turn and its Rhea plan to stop at the next safe point.
 pub fn request_cancel() {
     CANCEL_GENERATION.fetch_add(1, Ordering::SeqCst);
 }
 pub fn cancel_requested() -> bool {
     RUN_GENERATION.with(|run| run.get()) != CANCEL_GENERATION.load(Ordering::SeqCst)
         || STOP_FLAG.with(|slot| slot.borrow().as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)))
+}
+
+/// Split text into pieces of at most `max_units` UTF-16 code units without ever cutting a
+/// character in half (an emoji is two units and must stay whole). macOS types text in such pieces.
+pub fn utf16_chunks(text: &str, max_units: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut units = 0;
+    for c in text.chars() {
+        let width = c.len_utf16();
+        if units + width > max_units && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            units = 0;
+        }
+        current.push(c);
+        units += width;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 pub fn execute(name: &str, arguments: &Value) -> Result<Value, String> {
@@ -148,7 +169,7 @@ pub fn execute(name: &str, arguments: &Value) -> Result<Value, String> {
         "type_text" => {
             let text = required_string(arguments, "text")?;
             if text.chars().count() > 2000 {
-                return Err("JEV limits one typing action to 2,000 characters.".into());
+                return Err("Rhea limits one typing action to 2,000 characters.".into());
             }
             type_text(text)?;
             Ok(json!({"typed_characters": text.chars().count()}))
@@ -158,7 +179,7 @@ pub fn execute(name: &str, arguments: &Value) -> Result<Value, String> {
             press_key(key)?;
             Ok(json!({"pressed": key}))
         }
-        _ => Err(format!("JEV does not provide a tool named '{name}'.")),
+        _ => Err(format!("Rhea does not provide a tool named '{name}'.")),
     }
 }
 
@@ -243,7 +264,7 @@ pub(crate) fn type_text(text: &str) -> Result<(), String> {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn type_text(_text: &str) -> Result<(), String> {
-    Err("JEV keyboard typing is available on Windows and macOS only.".into())
+    Err("Rhea keyboard typing is available on Windows and macOS only.".into())
 }
 
 /// Press a key combination ("ENTER", "ctrl+k", "ctrl+shift+tab", "f5").
@@ -385,7 +406,7 @@ pub fn open_app(requested: &str) -> Result<Value, String> {
 }
 
 /// Execute a ChatGPT-authored plan end to end on this PC. ChatGPT decides the
-/// steps and the exact text once; JEV resolves controls by label, acts, and
+/// steps and the exact text once; Rhea resolves controls by label, acts, and
 /// moves on without a model round trip. The first step that cannot be
 /// confirmed stops the plan and returns the current screen so ChatGPT can
 /// re-plan from there. Nothing after a failed step runs.
@@ -435,7 +456,10 @@ pub fn run_plan(arguments: &Value) -> Result<Value, String> {
                              y: Option<i64>|
              -> Result<(i32, i32), String> {
                 if let (Some(x), Some(y)) = (x, y) {
-                    return Ok((x as i32, y as i32));
+                    return match (i32::try_from(x), i32::try_from(y)) {
+                        (Ok(x), Ok(y)) => Ok((x, y)),
+                        _ => Err(format!("The point ({x}, {y}) is outside the range a screen can have.")),
+                    };
                 }
                 let target = target.ok_or("Give a target label or x and y.")?;
                 let found = desktop::locate(&current_app()?, target, within, false)?;
@@ -461,7 +485,7 @@ pub fn run_plan(arguments: &Value) -> Result<Value, String> {
                     let detach = field("keys") == Some("detach");
                     let timeout = int("ms").filter(|ms| *ms > 0).unwrap_or(120_000);
                     let result = crate::shell::execute(
-                        "mcp__jarvus_shell__run_command",
+                        "mcp__rhea_shell__run_command",
                         &json!({"command": command, "working_directory": directory.to_string_lossy(),
                                 "timeout_ms": timeout, "shell": null, "detach": detach}),
                     )?;
@@ -624,7 +648,7 @@ pub fn run_plan(arguments: &Value) -> Result<Value, String> {
                     }
                 }
                 web if web.starts_with("web_") => {
-                    // Chrome via the JARVUS extension: same plan, no model round trips.
+                    // Chrome via the Rhea extension: same plan, no model round trips.
                     let mut params = serde_json::Map::new();
                     for (key, value) in [
                         ("target", field("target")),
@@ -817,7 +841,7 @@ fn native_type(app: &str, target: Option<&str>, text: &str, submit: bool) -> Nat
     use std::time::Duration;
     if text.chars().count() > 2000 {
         return NativeType::Failed {
-            reason: "JEV limits one typing step to 2,000 characters.".into(),
+            reason: "Rhea limits one typing step to 2,000 characters.".into(),
             submitted: false,
         };
     }
@@ -1312,4 +1336,20 @@ fn required_u64(value: &Value, key: &str) -> Result<u64, String> {
         .get(key)
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("Tool argument '{key}' must be a non-negative integer."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utf16_chunks;
+
+    #[test]
+    fn typed_text_is_split_without_cutting_an_emoji_in_half() {
+        let text = "ab😀cd😀😀ef";
+        let chunks = utf16_chunks(text, 4);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|piece| piece.encode_utf16().count() <= 4), "{chunks:?}");
+        assert!(chunks.iter().all(|piece| !piece.contains('\u{fffd}')));
+        assert_eq!(utf16_chunks("", 16), Vec::<String>::new());
+        assert_eq!(utf16_chunks("😀", 1), ["😀"], "a character wider than the limit still goes out whole");
+    }
 }

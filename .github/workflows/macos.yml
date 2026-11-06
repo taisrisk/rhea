@@ -1,8 +1,10 @@
 name: macOS build
 
-# Builds, tests and packages JARVUS for macOS (Apple Silicon and Intel). The Windows build is made
-# on a PC and uploaded to the release by hand (scripts/release.ps1 -Upload); publishing a release
-# makes this workflow attach the macOS .dmg and .zip files to it automatically.
+# Builds, tests and packages Rhea for macOS (Apple Silicon and Intel). The Windows build is made on
+# a PC by build.ps1, which bumps the version, tags it and pushes: pushing the tag (vX.Y.Z) makes
+# this workflow build both Mac versions and attach the .dmg and .zip files to that tag's release
+# (creating the release if build.ps1 has not yet). Pushes and pull requests without a tag only
+# build and test.
 
 on:
   push:
@@ -64,10 +66,10 @@ jobs:
           agent-desktop version
 
       - name: Test
-        run: cargo test --locked --bin jarvus --target ${{ matrix.rust_target }}
+        run: cargo test --locked --bin rhea --target ${{ matrix.rust_target }}
 
       - name: Build
-        run: cargo build --release --locked --bin jarvus --target ${{ matrix.rust_target }}
+        run: cargo build --release --locked --bin rhea --target ${{ matrix.rust_target }}
 
       - name: Package .app, .zip and .dmg
         env:
@@ -82,10 +84,10 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: jarvus-macos-${{ matrix.asset_arch }}
+          name: rhea-macos-${{ matrix.asset_arch }}
           path: |
-            dist/JARVUS-v*-macos-*.dmg
-            dist/JARVUS-v*-macos-*.zip
+            dist/Rhea-v*-macos-*.dmg
+            dist/Rhea-v*-macos-*.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -93,6 +95,7 @@ jobs:
     name: Attach macOS builds to the release
     needs: build
     if: >-
+      (github.event_name == 'push' && github.ref_type == 'tag') ||
       (github.event_name == 'release' && github.event.action == 'published') ||
       (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-latest
@@ -102,7 +105,7 @@ jobs:
       - name: Download macOS artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: jarvus-macos-*
+          pattern: rhea-macos-*
           path: dist
           merge-multiple: true
 
@@ -110,7 +113,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || github.ref_name }}
         run: |
           ls -l dist
+          # build.ps1 normally creates the release; make one if the Mac builds finished first.
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" --title "Rhea $RELEASE_TAG" --generate-notes || gh release view "$RELEASE_TAG" >/dev/null
           gh release upload "$RELEASE_TAG" dist/*.dmg dist/*.zip --clobber

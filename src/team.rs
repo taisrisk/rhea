@@ -156,8 +156,6 @@ struct State {
     ask_answer: Option<Option<Vec<(String, String)>>>,
     plan: Option<PlanRequest>,
     plan_decision: Option<PlanDecision>,
-    /// Each agent's own model transcript (kept out of `Agent` so listing agents stays cheap).
-    model_states: HashMap<String, crate::chat_store::ModelState>,
 }
 
 pub struct Hub {
@@ -279,6 +277,9 @@ impl Hub {
             request
         };
         let agent_id = request.agent_id.clone();
+        // The run's own stop token: if the thread cannot start, finishing the run must present
+        // this one, or the agent would stay "running" for good.
+        let run_stop = request.stop.clone();
         thread::Builder::new()
             .name(format!("agent-{}", request.name))
             .spawn(move || {
@@ -288,7 +289,7 @@ impl Hub {
                 hub.finish_run(&request.agent_id, &request.stop, outcome);
             })
             .unwrap_or_else(|error| {
-                self.finish_run(&agent_id, &Arc::new(AtomicBool::new(false)), Err(format!("Could not start agent thread: {error}")));
+                self.finish_run(&agent_id, &run_stop, Err(format!("Could not start agent thread: {error}")));
                 unreachable_handle()
             });
     }
@@ -424,12 +425,19 @@ impl Hub {
     }
 
     /// The model transcript an agent continues from (empty for a new agent).
+    /// It lives in the chat's folder (`agent-<id>.json`), opened on first use and closed with the
+    /// chat's other files, not held in memory for the whole session.
     pub fn agent_state(&self, id: &str) -> crate::chat_store::ModelState {
-        self.lock().model_states.get(id).cloned().unwrap_or_default()
+        match self.get(id) {
+            Some(agent) => crate::chat_store::load_agent_state(&agent.chat_id, id),
+            None => Default::default(),
+        }
     }
 
     pub fn set_agent_state(&self, id: &str, state: crate::chat_store::ModelState) {
-        self.lock().model_states.insert(id.to_owned(), state);
+        if let Some(agent) = self.get(id) {
+            crate::chat_store::save_agent_state(&agent.chat_id, id, &state);
+        }
     }
 
     /// Hand `text` to the manager of `chat_id` from outside the team (the user steering a run).
@@ -691,15 +699,25 @@ fn agents_path(chat_id: &str) -> Option<PathBuf> {
     crate::chat_store::app_data_root().map(|root| root.join("agents").join(format!("{chat_id}.json")))
 }
 
+/// Agents of one chat share a file; two finishing at the same moment must not overwrite each
+/// other's update, so each read-modify-write takes this lock.
+fn save_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn save_agent(chat_id: &str, agent: &Agent) {
     let Some(path) = agents_path(chat_id) else { return };
+    let _one_at_a_time = save_lock().lock().unwrap_or_else(|p| p.into_inner());
     let mut all: Vec<Agent> = fs::read_to_string(&path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
     all.retain(|a| a.id != agent.id);
     all.push(agent.clone());
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = crate::chat_store::write_json_atomic(&path, &all);
+    if let Err(error) = crate::chat_store::write_json_atomic(&path, &all) {
+        crate::chat_store::report_save_error("the subagent list", &error);
+    }
 }
 
 #[cfg(test)]

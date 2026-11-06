@@ -1,4 +1,4 @@
-//! Platform desktop layer for JEV. Windows uses UI Automation/Win32 directly;
+//! Platform desktop layer for Rhea. Windows uses UI Automation/Win32 directly;
 //! macOS delegates accessibility and input to Agent Desktop's supported CLI.
 //!
 //! agent-desktop re-walks an app's whole accessibility tree for every ref
@@ -218,7 +218,7 @@ mod imp {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
             }
             // Windows only lets the foreground thread hand focus away; borrow its
-            // input queue for the switch so this works from JEV's worker thread.
+            // input queue for the switch so this works from Rhea's worker thread.
             let foreground_thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
             let current_thread = GetCurrentThreadId();
             let attached = foreground_thread != 0
@@ -320,7 +320,16 @@ mod imp {
                 .ElementFromHandleBuildCache(hwnd, &request)
                 .map_err(|error| format!("Could not read the {app} window: {error}"))?;
             let mut budget = 25_000usize;
-            Ok(convert(&root, &mut budget))
+            let mut tree = convert(&root, &mut budget);
+            // A huge window is cut at the budget. Say so, so a missing control is not reported as
+            // "not found" when it was simply never read.
+            if budget == 0 {
+                if let Some(object) = tree.as_object_mut() {
+                    object.insert("truncated".into(), json!(true));
+                    object.insert("truncated_note".into(), json!("This window has more controls than the 25,000 that were read, so some are missing. Narrow the search (target_text, a smaller surface) before concluding a control does not exist."));
+                }
+            }
+            Ok(tree)
         }
     }
 
@@ -755,7 +764,7 @@ mod macos {
     }
 
     pub fn focused_control() -> Result<FocusedControl, String> {
-        Err("On macOS, JEV uses Agent Desktop accessibility refs instead of native focused-control reads.".into())
+        Err("On macOS, Rhea uses Agent Desktop accessibility refs instead of native focused-control reads.".into())
     }
 
     pub fn foreground_title() -> String {
@@ -784,7 +793,7 @@ mod macos {
     }
 
     pub fn focus_text_field(_score: &dyn Fn(&str) -> i32) -> Result<bool, String> {
-        // JEV's caller falls through to an Agent Desktop ref action when this
+        // Rhea's caller falls through to an Agent Desktop ref action when this
         // platform-specific shortcut is unavailable.
         Ok(false)
     }
@@ -892,7 +901,7 @@ pub fn tree_summary(tree: &Value) -> usize {
 
 #[cfg(all(test, windows))]
 mod live {
-    /// Live probes: `cargo test --bin jarvus uia::live -- --ignored --nocapture`.
+    /// Live probes: `cargo test --bin rhea uia::live -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn probe_quick_switcher() {

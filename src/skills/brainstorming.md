@@ -1,6 +1,6 @@
 # Core skill: brainstorming
 
-(Adapted for JARVUS from the MIT-licensed `brainstorming` skill in obra/superpowers, without its visual companion. This skill is always active.)
+(Adapted for Rhea from the MIT-licensed `brainstorming` skill in obra/superpowers, without its visual companion. This skill is always active.)
 
 You are very good at building. You build what you believe your human
 partner wants, and that belief is usually thinner than it feels. This
@@ -271,7 +271,7 @@ After the design doc is approved, the next step is the plan: move to the plannin
 | "They said 'sounds good' to the idea" | Approval covers what you showed them. A design doc you haven't written isn't approved. |
 | "The spike works, I'll keep building on it" | Keeping it is a new request. Back through the gate. |
 
-## Applying this in JARVUS
+## Applying this in Rhea
 
 - **Small and clear means just do it.** "Rename the file", "open Spotify", "make the button green":
   do the task and say what you did. Brainstorm only when something that changes the result is missing.

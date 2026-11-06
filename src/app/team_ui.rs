@@ -121,7 +121,7 @@ fn paint_avatar(ui: &egui::Ui, agent: &Agent, rect: Rect) {
         .paint_at(ui, rect);
 }
 
-impl JarvusApp {
+impl RheaApp {
     pub(super) fn main_tool_context(&self) -> tools::ToolContext {
         tools::ToolContext {
             mcp_manager: Arc::clone(&self.mcp_manager),
@@ -133,6 +133,7 @@ impl JarvusApp {
             model: self.selected_model.clone(),
             effort: self.reasoning_effort.clone(),
             context_window: self.context_window,
+            fast: self.fast_mode,
             compose: self.compose_mode,
             subagent_model: self.subagent_model.clone(),
             compact_percent: self.compact_percent,
@@ -320,7 +321,7 @@ impl JarvusApp {
                     egui::TextEdit::multiline(&mut self.plan_feedback)
                         .desired_rows(1)
                         .desired_width(width)
-                        .hint_text(egui::RichText::new("Tell JEV what to change in the plan").color(MUTED)),
+                        .hint_text(egui::RichText::new("Tell Rhea what to change in the plan").color(MUTED)),
                 );
                 if !edit.has_focus() && !self.plan_feedback_focused {
                     edit.request_focus();
@@ -338,10 +339,10 @@ impl JarvusApp {
             });
         } else {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(egui::Button::new(egui::RichText::new("Accept").size(12.5).strong().color(INK)).fill(Color32::from_rgb(33, 78, 55)).corner_radius(CornerRadius::same(14)).min_size(Vec2::new(84.0, 30.0))).on_hover_text("Accept the plan and let JEV start working").clicked() {
+                if ui.add(egui::Button::new(egui::RichText::new("Accept").size(12.5).strong().color(INK)).fill(Color32::from_rgb(33, 78, 55)).corner_radius(CornerRadius::same(14)).min_size(Vec2::new(84.0, 30.0))).on_hover_text("Accept the plan and let Rhea start working").clicked() {
                     accept = true;
                 }
-                if ui.add(egui::Button::new(egui::RichText::new("Revise").size(12.5).color(INK)).fill(MINT).corner_radius(CornerRadius::same(14)).min_size(Vec2::new(78.0, 30.0))).on_hover_text("Ask JEV to change the plan").clicked() {
+                if ui.add(egui::Button::new(egui::RichText::new("Revise").size(12.5).color(INK)).fill(MINT).corner_radius(CornerRadius::same(14)).min_size(Vec2::new(78.0, 30.0))).on_hover_text("Ask Rhea to change the plan").clicked() {
                     self.plan_revising = true;
                     self.plan_feedback_focused = false;
                 }
@@ -519,7 +520,7 @@ impl JarvusApp {
         let installed = crate::skills::list();
         settings_group(ui, Some("Skills"), |ui| {
             if installed.is_empty() {
-                settings_row(ui, Some(MUTED), "No skills installed", "Paste a GitHub link below, or ask JEV to install one. Folders in ~/.jarvus/skills, ~/.agents/skills and ~/.claude/skills are found automatically.", |_| {});
+                settings_row(ui, Some(MUTED), "No skills installed", "Paste a GitHub link below, or ask Rhea to install one. Folders in ~/.rhea/skills, ~/.agents/skills and ~/.claude/skills are found automatically.", |_| {});
             }
             let mut remove: Option<String> = None;
             for (index, skill) in installed.iter().enumerate() {
@@ -528,7 +529,7 @@ impl JarvusApp {
                 }
                 let detail = if skill.description.is_empty() { format!("/{} · {}", skill.name, skill.source) } else { format!("/{} · {}", skill.name, skill.description) };
                 settings_row(ui, Some(HOVER_GREEN), &skill.name, &detail, |ui| {
-                    if skill.source == "jarvus" && action_button(ui, "cancel", "Remove", false).clicked() {
+                    if skill.source == "rhea" && action_button(ui, "cancel", "Remove", false).clicked() {
                         remove = Some(skill.name.clone());
                     }
                 });
@@ -569,7 +570,7 @@ impl JarvusApp {
             } else {
                 self.model_list.iter().find(|m| m.slug == self.subagent_model).map(|m| m.display_name.clone()).unwrap_or_else(|| self.subagent_model.clone())
             };
-            settings_row(ui, None, "Model for subagents", "Workers started by JEV use this model unless told otherwise.", |ui| {
+            settings_row(ui, None, "Model for subagents", "Workers started by Rhea use this model unless told otherwise.", |ui| {
                 egui::ComboBox::from_id_salt("subagent-model").selected_text(current).show_ui(ui, |ui| {
                     if ui.selectable_label(self.subagent_model.is_empty(), "Same as the main model").clicked() {
                         self.subagent_model.clear();
@@ -592,7 +593,7 @@ impl JarvusApp {
                 ui,
                 Some(if hook_count > 0 { HOVER_GREEN } else { MUTED }),
                 &format!("{hook_count} hook{} active", if hook_count == 1 { "" } else { "s" }),
-                &crate::hooks::default_path().display().to_string(),
+                &chat_store::tilde(&crate::hooks::default_path()),
                 |ui| {
                     if action_button(ui, "refresh", "Reload", false).clicked() {
                         match HookRegistry::load(&crate::hooks::default_path()) {

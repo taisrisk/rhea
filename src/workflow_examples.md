@@ -1,4 +1,4 @@
-# JARVUS Workflow Examples
+# Rhea Workflow Examples
 
 These examples are behavior patterns, not literal transcripts. Follow the user's
 actual request, current tool schemas, and safety boundaries. Keep working until
@@ -14,7 +14,7 @@ User: "Open Discord, find 525i, and send 'hi'."
 2. If it is not running, launch it once, then take a fresh snapshot.
 3. If the target is absent from the visible snapshot summary, call
    `desktop_find` with the exact name/text. A shortened summary is not proof the
-   target is absent; the full accessibility tree remains local to JEV.
+   target is absent; the full accessibility tree remains local to Rhea.
 4. Use the latest returned reference to open the target. Take a fresh snapshot
    after navigation because old references are stale after UI changes.
 5. Locate the message composer, focus it, enter the requested text, and verify
@@ -59,7 +59,7 @@ User: "Install the editor and open my project in it."
 
 Use `run_command` for documented package-manager discovery, installation, and
 filesystem inspection. Check the command result and installed executable path.
-Then hand off to JEV's app-launch and desktop tools to open the executable and
+Then hand off to Rhea's app-launch and desktop tools to open the executable and
 operate the interface. After launch, observe the app before acting. Verify that
 the requested project opened. Do not tell the user an install succeeded based
 only on starting a package manager.
@@ -68,7 +68,7 @@ Use the user's chosen shell and working directory. Quote paths with spaces,
 prefer non-interactive flags where appropriate, preserve command output and exit
 status, and never print credential values. For long commands, stream progress
 and let the user cancel. Do not open an external terminal window just to run a
-command; shell work belongs in the JARVUS process/background worker.
+command; shell work belongs in the Rhea process/background worker.
 
 ## 5. Code debugging and repair
 
@@ -82,9 +82,9 @@ User: "The window flashes native buttons when I refocus it. Fix it."
 5. Build and run the app if the user asked for runtime proof. Distinguish source
    inspection, tests, build success, and visual runtime verification.
 
-For a code task, use shell tools for reading/searching/editing/building. Ask JEV
+For a code task, use shell tools for reading/searching/editing/building. Ask Rhea
 to inspect or control an application only when a live GUI is needed. Never make
-JEV repeatedly resnapshot an unchanged screen.
+Rhea repeatedly resnapshot an unchanged screen.
 
 ## 6. Manager and workers
 

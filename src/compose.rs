@@ -15,6 +15,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "list_mcps",
     "get_tools_",
     "use_skill",
+    "laya_decide",
+    "memory_search",
     "ask_user",
     "propose_plan",
     "agent_spawn",
@@ -23,9 +25,9 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "agent_read",
     "agent_wait",
     "agent_stop",
-    "mcp__jarvus_shell__list_directory",
-    "mcp__jarvus_shell__read_file",
-    "mcp__jarvus_shell__web_fetch",
+    "mcp__rhea_shell__list_directory",
+    "mcp__rhea_shell__read_file",
+    "mcp__rhea_shell__web_fetch",
     "browser__tabs",
     "browser__snapshot",
     "browser__extract",
@@ -37,7 +39,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "browser__activate",
 ];
 
-const RUN_COMMAND: &str = "mcp__jarvus_shell__run_command";
+const RUN_COMMAND: &str = "mcp__rhea_shell__run_command";
 const MAX_COMMAND_CHARS: usize = 20_000;
 
 /// Ok if `name` may be used in compose mode with these arguments.
@@ -347,20 +349,20 @@ mod tests {
 
     #[test]
     fn tool_matrix() {
-        for name in ["list_mcps", "get_tools_", "ask_user", "propose_plan", "agent_spawn", "mcp__jarvus_shell__read_file", "browser__extract", "desktop_snapshot"] {
+        for name in ["list_mcps", "get_tools_", "ask_user", "propose_plan", "agent_spawn", "mcp__rhea_shell__read_file", "browser__extract", "desktop_snapshot"] {
             assert!(tool_allowed(name, &json!({})).is_ok(), "{name}");
         }
         for name in [
             "jev_run_plan", "open_app", "desktop_click", "desktop_type", "desktop_send", "desktop_press", "desktop_launch", "mcp_add_servers",
-            "mcp__jarvus_shell__write_file", "mcp__jarvus_shell__edit_file", "mcp__jarvus_shell__create_directory", "browser__click", "browser__type",
+            "mcp__rhea_shell__write_file", "mcp__rhea_shell__edit_file", "mcp__rhea_shell__create_directory", "browser__click", "browser__type",
             "mcp__potassium__execute_script", "totally_unknown",
         ] {
             let error = tool_allowed(name, &json!({})).unwrap_err();
             assert!(error.contains("Compose"), "{name}: {error}");
         }
-        assert!(tool_allowed("mcp__jarvus_shell__run_command", &json!({"command":"git status"})).is_ok());
-        assert!(tool_allowed("mcp__jarvus_shell__run_command", &json!({"command":"rm -rf x"})).is_err());
-        assert!(tool_allowed("mcp__jarvus_shell__run_command", &json!({})).is_err());
+        assert!(tool_allowed("mcp__rhea_shell__run_command", &json!({"command":"git status"})).is_ok());
+        assert!(tool_allowed("mcp__rhea_shell__run_command", &json!({"command":"rm -rf x"})).is_err());
+        assert!(tool_allowed("mcp__rhea_shell__run_command", &json!({})).is_err());
     }
 
     #[test]
@@ -368,13 +370,13 @@ mod tests {
         let tools = vec![
             json!({"name":"list_mcps"}),
             json!({"name":"jev_run_plan"}),
-            json!({"name":"mcp__jarvus_shell__run_command"}),
-            json!({"name":"mcp__jarvus_shell__write_file"}),
+            json!({"name":"mcp__rhea_shell__run_command"}),
+            json!({"name":"mcp__rhea_shell__write_file"}),
             json!({"name":"browser__click"}),
             json!({"name":"browser__extract"}),
             json!({"no_name":true}),
         ];
         let names: Vec<_> = filter_tools(&tools).iter().filter_map(|tool| tool["name"].as_str().map(str::to_owned)).collect();
-        assert_eq!(names, vec!["list_mcps", "mcp__jarvus_shell__run_command", "browser__extract"]);
+        assert_eq!(names, vec!["list_mcps", "mcp__rhea_shell__run_command", "browser__extract"]);
     }
 }

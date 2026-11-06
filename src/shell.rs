@@ -37,13 +37,13 @@ pub fn tool_specs() -> Value {
 
 pub fn execute(name: &str, args: &Value) -> Result<Value, String> {
     match name {
-        "mcp__jarvus_shell__run_command" => run_command(args),
-        "mcp__jarvus_shell__list_directory" => list_directory(args),
-        "mcp__jarvus_shell__read_file" => read_file(args),
-        "mcp__jarvus_shell__write_file" => write_file(args),
-        "mcp__jarvus_shell__edit_file" => edit_file(args),
-        "mcp__jarvus_shell__create_directory" => create_directory(args),
-        "mcp__jarvus_shell__web_fetch" => web_fetch(args),
+        "mcp__rhea_shell__run_command" => run_command(args),
+        "mcp__rhea_shell__list_directory" => list_directory(args),
+        "mcp__rhea_shell__read_file" => read_file(args),
+        "mcp__rhea_shell__write_file" => write_file(args),
+        "mcp__rhea_shell__edit_file" => edit_file(args),
+        "mcp__rhea_shell__create_directory" => create_directory(args),
+        "mcp__rhea_shell__web_fetch" => web_fetch(args),
         _ => Err(format!("Unknown Shell tool '{name}'.")),
     }
 }
@@ -541,7 +541,7 @@ fn edit_by_lines(path: &Path, edits: &[Value]) -> Result<Value, String> {
     if updated.len() > MAX_FILE_BYTES {
         return Err(format!("The edited file would exceed the {MAX_FILE_BYTES}-byte limit. Nothing was written."));
     }
-    let temp = path.with_extension(format!("{}.jarvus-edit", path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
+    let temp = path.with_extension(format!("{}.rhea-edit", path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")));
     fs::write(&temp, &updated).map_err(|error| format!("Could not stage the edit: {error}"))?;
     if let Err(error) = fs::rename(&temp, path) {
         let _ = fs::remove_file(&temp);
@@ -632,7 +632,7 @@ fn web_fetch(args: &Value) -> Result<Value, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent(format!("JARVUS/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("Rhea/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| format!("Could not create HTTP client: {error}"))?;
     let mut response = client
@@ -677,7 +677,7 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = env::temp_dir().join(format!("jarvus-shell-{label}-{nonce}"));
+        let path = env::temp_dir().join(format!("rhea-shell-{label}-{nonce}"));
         fs::create_dir_all(&path).unwrap();
         path
     }
@@ -692,14 +692,14 @@ mod tests {
             tool["name"]
                 .as_str()
                 .unwrap()
-                .starts_with("mcp__jarvus_shell__")
+                .starts_with("mcp__rhea_shell__")
         }));
     }
 
     #[test]
     fn run_command_schema_exposes_shell_detach_and_long_timeouts() {
         let tools = tool_specs();
-        let run = tools.as_array().unwrap().iter().find(|tool| tool["name"] == "mcp__jarvus_shell__run_command").unwrap();
+        let run = tools.as_array().unwrap().iter().find(|tool| tool["name"] == "mcp__rhea_shell__run_command").unwrap();
         let properties = run["parameters"]["properties"].as_object().unwrap();
         for key in ["command", "working_directory", "timeout_ms", "shell", "detach"] {
             assert!(properties.contains_key(key), "missing {key}");
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn unknown_or_unavailable_shells_are_rejected_cleanly() {
         let directory = temporary_directory("badshell");
-        let error = execute("mcp__jarvus_shell__run_command", &json!({"command":"echo hi","working_directory":directory.to_str().unwrap(),"shell":"fish","detach":null,"timeout_ms":null})).unwrap_err();
+        let error = execute("mcp__rhea_shell__run_command", &json!({"command":"echo hi","working_directory":directory.to_str().unwrap(),"shell":"fish","detach":null,"timeout_ms":null})).unwrap_err();
         assert!(error.contains("Unknown shell"), "{error}");
         let _ = fs::remove_dir_all(directory);
     }
@@ -720,12 +720,12 @@ mod tests {
     fn windows_shells_cmd_powershell_and_utf8_output() {
         let directory = temporary_directory("shells");
         let dir = directory.to_str().unwrap();
-        let cmd = execute("mcp__jarvus_shell__run_command", &json!({"command":"echo from-cmd","working_directory":dir,"shell":"cmd","detach":null,"timeout_ms":null})).unwrap();
+        let cmd = execute("mcp__rhea_shell__run_command", &json!({"command":"echo from-cmd","working_directory":dir,"shell":"cmd","detach":null,"timeout_ms":null})).unwrap();
         assert_eq!(cmd["success"], true);
         assert!(cmd["stdout"].as_str().unwrap().contains("from-cmd"));
-        let ps = execute("mcp__jarvus_shell__run_command", &json!({"command":"Write-Output 'héllo ✓'","working_directory":dir,"shell":"powershell","detach":null,"timeout_ms":null})).unwrap();
+        let ps = execute("mcp__rhea_shell__run_command", &json!({"command":"Write-Output 'héllo ✓'","working_directory":dir,"shell":"powershell","detach":null,"timeout_ms":null})).unwrap();
         assert!(ps["stdout"].as_str().unwrap().contains("héllo ✓"), "{ps}");
-        let failing = execute("mcp__jarvus_shell__run_command", &json!({"command":"exit 7","working_directory":dir,"shell":null,"detach":null,"timeout_ms":null})).unwrap();
+        let failing = execute("mcp__rhea_shell__run_command", &json!({"command":"exit 7","working_directory":dir,"shell":null,"detach":null,"timeout_ms":null})).unwrap();
         assert_eq!(failing["success"], false);
         assert_eq!(failing["exit_code"], 7);
         let _ = fs::remove_dir_all(directory);
@@ -736,7 +736,7 @@ mod tests {
     fn detached_commands_return_a_pid_without_waiting() {
         let directory = temporary_directory("detach");
         let started = Instant::now();
-        let result = execute("mcp__jarvus_shell__run_command", &json!({"command":"Start-Sleep 20","working_directory":directory.to_str().unwrap(),"shell":null,"detach":true,"timeout_ms":null})).unwrap();
+        let result = execute("mcp__rhea_shell__run_command", &json!({"command":"Start-Sleep 20","working_directory":directory.to_str().unwrap(),"shell":null,"detach":true,"timeout_ms":null})).unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(result["detached"], true);
         let pid = result["pid"].as_u64().unwrap();
@@ -750,7 +750,7 @@ mod tests {
     fn timeouts_kill_the_whole_process_tree() {
         let directory = temporary_directory("tree");
         let started = Instant::now();
-        let result = execute("mcp__jarvus_shell__run_command", &json!({"command":"Start-Sleep 30","working_directory":directory.to_str().unwrap(),"shell":null,"detach":null,"timeout_ms":1500})).unwrap();
+        let result = execute("mcp__rhea_shell__run_command", &json!({"command":"Start-Sleep 30","working_directory":directory.to_str().unwrap(),"shell":null,"detach":null,"timeout_ms":1500})).unwrap();
         assert_eq!(result["timed_out"], true);
         assert!(started.elapsed() < Duration::from_secs(10));
         let _ = fs::remove_dir_all(directory);

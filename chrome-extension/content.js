@@ -1,10 +1,10 @@
-// JARVUS page engine. Injected on demand by background.js; answers one
+// Rhea page engine. Injected on demand by background.js; answers one
 // command at a time. Elements are targeted by visible label (fuzzy: case,
 // symbols and extra words don't matter; best visible match wins), by a
 // controlId from the latest snapshot, or by CSS selector.
 (() => {
-  if (globalThis.__jarvusPageEngine) return;
-  globalThis.__jarvusPageEngine = true;
+  if (globalThis.__rheaPageEngine) return;
+  globalThis.__rheaPageEngine = true;
 
   const INTERACTIVE = [
     "a[href]", "button", "input:not([type=hidden])", "select", "textarea", "summary", "label",
@@ -208,7 +208,7 @@
     return { navigating: Boolean(href && !href.startsWith("javascript:") && new URL(href, location.href).href.split("#")[0] !== location.href.split("#")[0]) };
   }
 
-  const isConsequentialAction = (value) => globalThis.JarvusActionPolicy?.isConsequentialAction(value) === true;
+  const isConsequentialAction = (value) => globalThis.RheaActionPolicy?.isConsequentialAction(value) === true;
 
   function submitterFor(element) {
     const form = element?.form || element?.closest?.("form");
@@ -231,7 +231,7 @@
   function requestUserApproval(action, detail) {
     return new Promise((resolve) => {
       const host = document.createElement("div");
-      host.setAttribute("data-jarvus-approval", "true");
+      host.setAttribute("data-rhea-approval", "true");
       host.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483647;pointer-events:auto";
       const shadow = host.attachShadow({ mode: "closed" });
       const style = document.createElement("style");
@@ -256,7 +256,7 @@
       dialog.setAttribute("role", "alertdialog");
       dialog.setAttribute("aria-modal", "true");
       const title = document.createElement("h2");
-      title.textContent = "JARVUS approval required";
+      title.textContent = "Rhea approval required";
       const description = document.createElement("p");
       description.textContent = `Allow the browser action: ${action}?`;
       const extra = document.createElement("p");
@@ -494,7 +494,7 @@
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (sender.id !== chrome.runtime.id || sender.tab || !message?.jarvus) return false;
+    if (sender.id !== chrome.runtime.id || sender.tab || !message?.rhea) return false;
     run(message.method, message.params || {}).then(
       (value) => sendResponse({ ok: true, value, navigating: Boolean(value?.navigating) }),
       (error) => sendResponse({ ok: false, error: String(error?.message || error) }),

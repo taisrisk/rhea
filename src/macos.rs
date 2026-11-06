@@ -1,10 +1,10 @@
-//! Native macOS input and window control for JEV: CoreGraphics events for the pointer and the
+//! Native macOS input and window control for Rhea: CoreGraphics events for the pointer and the
 //! keyboard, and System Events (AppleScript) for "which app and window is in front". Reading an
 //! app's accessibility tree and acting on its elements still goes through Agent Desktop, which wraps
 //! the macOS Accessibility (AX) API; the code here is what makes pointer, keyboard and focus
 //! actions immediate instead of a CLI round trip each.
 //!
-//! Posting events needs the Accessibility permission for JARVUS (System Settings > Privacy &
+//! Posting events needs the Accessibility permission for Rhea (System Settings > Privacy &
 //! Security > Accessibility). Without it macOS drops the events silently, so every entry point
 //! checks `AXIsProcessTrusted` first and says what to enable.
 
@@ -22,7 +22,7 @@ unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
 }
 
-const NOT_TRUSTED: &str = "macOS blocks JARVUS from controlling the keyboard and mouse until it is allowed in System Settings > Privacy & Security > Accessibility. Enable JARVUS there (add it with + if it is missing), then try again.";
+const NOT_TRUSTED: &str = "macOS blocks Rhea from controlling the keyboard and mouse until it is allowed in System Settings > Privacy & Security > Accessibility. Enable Rhea there (add it with + if it is missing), then try again.";
 
 pub fn accessibility_trusted() -> bool {
     // SAFETY: a plain query with no arguments.
@@ -39,7 +39,7 @@ fn require_trust() -> Result<(), String> {
     Err(NOT_TRUSTED.into())
 }
 
-/// Open the Accessibility pane of System Settings so the user can switch JARVUS on.
+/// Open the Accessibility pane of System Settings so the user can switch Rhea on.
 pub fn open_accessibility_settings() {
     let _ = Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn();
 }
@@ -230,9 +230,7 @@ pub fn type_text(text: &str) -> Result<(), String> {
         if index > 0 {
             press_combo("enter")?;
         }
-        let units: Vec<u16> = line.trim_end_matches('\r').encode_utf16().collect();
-        for chunk in units.chunks(16) {
-            let piece = String::from_utf16_lossy(chunk);
+        for piece in crate::jev::utf16_chunks(line.trim_end_matches('\r'), 16) {
             for down in [true, false] {
                 let event = CGEvent::new_keyboard_event(source()?, 0, down).map_err(|_| "Could not create a macOS key event.".to_owned())?;
                 event.set_string(&piece);

@@ -613,7 +613,7 @@ fn type_and_refresh_with_timeout(
     refresh_timeout_ms: u32,
 ) -> Result<Value, String> {
     if text.chars().count() > 2000 {
-        return Err("JEV limits one typing action to 2,000 characters.".into());
+        return Err("Rhea limits one typing action to 2,000 characters.".into());
     }
     validate_ref_snapshot(snapshot_id, reference)?;
     context_for_fresh_snapshot(snapshot_id)?;
@@ -652,7 +652,7 @@ fn press_from_snapshot_with_timeout(
         "alt+tab",
     ];
     if !allowed.contains(&normalized.as_str()) {
-        return Err("That key combination is not enabled for JEV.".into());
+        return Err("That key combination is not enabled for Rhea.".into());
     }
     let context = context_for_fresh_snapshot(snapshot_id)?;
     let mut args = vec!["press".to_owned(), normalized, "--headed".to_owned()];
@@ -789,7 +789,7 @@ fn type_failure_kind(
     "type_result_inconsistent"
 }
 
-/// One local JEV call for "message <recipient> in <app>": focus the app, reuse
+/// One local Rhea call for "message <recipient> in <app>": focus the app, reuse
 /// the open conversation when its composer already names the recipient,
 /// otherwise open it through the app's quick switcher (Ctrl+K), then type and
 /// submit once. Each step reads a fast interactive-only snapshot (~1 s on
@@ -801,7 +801,7 @@ pub fn message_conversation(app: &str, recipient: &str, text: &str) -> Result<Va
     let recipient = nonempty(recipient, "recipient")?;
     let text = nonempty(text, "message text")?;
     if text.chars().count() > 2000 {
-        return Err("JEV limits one message to 2,000 characters.".into());
+        return Err("Rhea limits one message to 2,000 characters.".into());
     }
     let started = Instant::now();
     let mut timings = serde_json::Map::new();
@@ -1400,12 +1400,27 @@ pub fn native_state(app: &str, focus_label: Option<&str>) -> Value {
         "items":items.into_iter().take(140).map(|(_, item)| item).collect::<Vec<_>>()})
 }
 
+/// A window with more controls than the native read keeps comes back marked `truncated`.
+fn tree_truncated(tree: &Value) -> bool {
+    tree.get("truncated").and_then(Value::as_bool) == Some(true)
+}
+
+/// A "not found" from a partly read window is not proof the control is absent.
+fn with_truncation_note(error: String, truncated: bool) -> String {
+    if truncated {
+        format!("{error} This window has more controls than were read, so it may be in the part that was cut off; narrow the search instead of concluding it does not exist.")
+    } else {
+        error
+    }
+}
+
 pub fn locate(
     app: &str,
     query: &str,
     within: Option<&str>,
     text_input: bool,
 ) -> Result<Located, String> {
+    let mut saw_truncated = false;
     let mut last_error = match within {
         Some(area) => {
             format!("Nothing visible matches '{query}' inside an area named like '{area}'.")
@@ -1442,16 +1457,17 @@ pub fn locate(
             },
         };
         let window = tree.get("bounds").and_then(parse_bounds);
+        saw_truncated |= tree_truncated(&tree);
         if let Some(found) = locate_in_tree(&tree, window, query, within, text_input) {
             return Ok(found);
         }
     }
-    Err(last_error)
+    Err(with_truncation_note(last_error, saw_truncated))
 }
 
 // ---- Plan-step primitives -------------------------------------------------
-// JEV runs a ChatGPT-authored step list locally (see jev::run_plan). Steps
-// name controls by their visible label; JEV resolves the label against a fast
+// Rhea runs a ChatGPT-authored step list locally (see jev::run_plan). Steps
+// name controls by their visible label; Rhea resolves the label against a fast
 // snapshot itself, so no model round trip is needed per step.
 
 /// Resolve a visible control label to one actionable ref in `app`, polling
@@ -1461,6 +1477,7 @@ pub fn locate(
 pub fn resolve_control(app: &str, label: &str, text_input: bool) -> Result<String, String> {
     let wanted = normalize_label(label);
     let mut last_error = String::new();
+    let mut saw_truncated = false;
     for attempt in 0..6 {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(150));
@@ -1482,11 +1499,14 @@ pub fn resolve_control(app: &str, label: &str, text_input: bool) -> Result<Strin
         let Some(tree) = snapshot.pointer("/data/tree") else {
             continue;
         };
+        saw_truncated |= tree_truncated(tree);
         let window = snapshot
             .pointer("/data/window/bounds")
             .or_else(|| tree.get("bounds"))
             .and_then(parse_bounds);
         let (mut exact, mut partial) = (Vec::new(), Vec::new());
+        // What each candidate looks like, so Laya can choose between look-alikes.
+        let mut described: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         walk_nodes(tree, &mut |node| {
             let Some(reference) = node.get("ref_id").and_then(Value::as_str) else {
                 return;
@@ -1516,12 +1536,29 @@ pub fn resolve_control(app: &str, label: &str, text_input: bool) -> Result<Strin
             if name.is_empty() {
                 return;
             }
+            if name == wanted || name.contains(&wanted) {
+                let place = node
+                    .get("bounds")
+                    .and_then(parse_bounds)
+                    .map(|b| format!(" at x={} y={} size {}x{}", b.x as i64, b.y as i64, b.width as i64, b.height as i64))
+                    .unwrap_or_default();
+                described.insert(reference.to_owned(), format!("{role} \"{}\"{place}", node.get("name").and_then(Value::as_str).unwrap_or_default()));
+            }
             if name == wanted {
                 exact.push(reference.to_owned());
             } else if name.contains(&wanted) {
                 partial.push(reference.to_owned());
             }
         });
+        // Several look-alikes: when the local model is running it can usually tell which one the
+        // step means; otherwise (or when it is unsure) the step stays ambiguous as before.
+        if exact.len() > 1 || (exact.is_empty() && partial.len() > 1) {
+            let pool = if exact.len() > 1 { &exact } else { &partial };
+            let options: Vec<(String, String)> = pool.iter().filter_map(|reference| described.get(reference).map(|text| (reference.clone(), text.clone()))).collect();
+            if let Some(chosen) = crate::laya::pick_control(label, &options) {
+                return Ok(chosen);
+            }
+        }
         match (exact.len(), partial.len()) {
             (1, _) => return Ok(exact.remove(0)),
             (0, 1) => return Ok(partial.remove(0)),
@@ -1538,12 +1575,12 @@ pub fn resolve_control(app: &str, label: &str, text_input: bool) -> Result<Strin
             }
         }
     }
-    Err(last_error)
+    Err(with_truncation_note(last_error, saw_truncated))
 }
 
 pub fn plan_type(reference: &str, text: &str) -> Result<(), String> {
     if text.chars().count() > 2000 {
-        return Err("JEV limits one typing step to 2,000 characters.".into());
+        return Err("Rhea limits one typing step to 2,000 characters.".into());
     }
     let command = run_type_with_focus(reference, text)?;
     let verified = command_ok(&command)
@@ -1711,10 +1748,12 @@ fn remember_snapshot(
         app,
         window_id,
         surface: surface.to_owned(),
+        // A tree cut at the read budget is never complete, whatever else the snapshot says.
         complete: data
             .get("complete")
             .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .unwrap_or(false)
+            && !tree_truncated(tree),
         bounds,
         elements,
         raw_tree,
@@ -2297,7 +2336,7 @@ fn context_for_ref(reference: &str) -> Result<(String, SnapshotContext), String>
         .get(&id)
         .cloned()
         .ok_or(
-            "This ref is not from a recent JEV snapshot. Take a fresh snapshot before acting.",
+            "This ref is not from a recent Rhea snapshot. Take a fresh snapshot before acting.",
         )?;
     Ok((id, context))
 }
@@ -2353,7 +2392,57 @@ fn perform_ref_action_with_timeout(
     scroll: Option<(String, u32)>,
     observation_timeout_ms: u32,
 ) -> Result<Value, String> {
+    perform_ref_action_once(action, reference, text, scroll, observation_timeout_ms, true)
+}
+
+/// Whether a refused action may be tried again on a re-found control. Only actions that are safe
+/// to repeat qualify: typing and sending can duplicate text, so they always go back to the model.
+fn retry_on_fresh_ref(action: &str) -> bool {
+    matches!(action, "click" | "hover" | "scroll")
+}
+
+/// The ref of the same control in a newer snapshot of the same window: same role and same label,
+/// and exactly one of them. Anything less certain returns None so the model chooses instead.
+fn re_resolve_ref(old: &SnapshotContext, reference: &str, fresh: &SnapshotContext) -> Option<String> {
+    if old.snapshot_id == fresh.snapshot_id {
+        return None;
+    }
+    let was = old.elements.iter().find(|hint| hint.reference.as_deref() == Some(reference))?;
+    let label = normalize_label(&was.name);
+    if label.is_empty() {
+        return None;
+    }
+    let mut same = fresh.elements.iter().filter(|hint| hint.role == was.role && normalize_label(&hint.name) == label);
+    let found = same.next()?;
+    if same.next().is_some() {
+        return None;
+    }
+    found.reference.clone()
+}
+
+fn perform_ref_action_once(
+    action: &str,
+    reference: &str,
+    text: Option<&str>,
+    scroll: Option<(String, u32)>,
+    observation_timeout_ms: u32,
+    may_retry: bool,
+) -> Result<Value, String> {
     let (original_snapshot_id, context) = context_for_ref(reference)?;
+    // After a refusal that delivered nothing, look at the screen again; when the control is
+    // still there exactly once, do the action on it (one retry, never for typing).
+    let retry = |reason: &str| -> Option<Result<Value, String>> {
+        if !may_retry || !retry_on_fresh_ref(action) {
+            return None;
+        }
+        let fresh = latest_context_for(context.app.as_deref(), context.window_id.as_deref())?;
+        let new_ref = re_resolve_ref(&context, reference, &fresh)?;
+        let mut result = perform_ref_action_once(action, &new_ref, text, scroll.clone(), observation_timeout_ms, false);
+        if let Ok(value) = result.as_mut() {
+            value["retried"] = json!({"from": reference, "to": new_ref, "reason": reason});
+        }
+        Some(result)
+    };
     let latest_snapshot = latest_by_scope()
         .lock()
         .ok()
@@ -2364,6 +2453,9 @@ fn perform_ref_action_with_timeout(
         context.captured_at.elapsed(),
     ) {
         let observation = observe_target_with_timeout(&context, observation_timeout_ms);
+        if let Some(result) = retry("stale ref") {
+            return result;
+        }
         return Ok(json!({
             "kind":"desktop_action","action":action,"status":"not_performed",
             "reason":"The ref is stale. Use a ref from the fresh observation before acting.",
@@ -2381,6 +2473,9 @@ fn perform_ref_action_with_timeout(
     };
     if command.as_ref().is_ok_and(stale_ref_safe_to_retry) {
         let observation = observe_target_with_timeout(&context, observation_timeout_ms);
+        if let Some(result) = retry("refused before delivery") {
+            return result;
+        }
         return Ok(json!({
             "kind":"desktop_action","action":action,"status":"not_performed",
             "reason":"Agent Desktop refused the stale ref before delivery. Use a ref from the fresh observation.",
@@ -2885,7 +2980,7 @@ fn run_command(args: &[String]) -> Result<CommandResult, String> {
     {
         use std::os::windows::process::CommandExt;
         // Agent Desktop is a separate CLI process. Keep its console hidden while
-        // retaining its structured stdout/stderr pipes for JEV.
+        // retaining its structured stdout/stderr pipes for Rhea.
         child.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     let output = child.output().map_err(|error| {
@@ -2910,13 +3005,13 @@ fn run_command(args: &[String]) -> Result<CommandResult, String> {
 }
 
 fn resolve_binary() -> Result<PathBuf, String> {
-    if let Some(path) = env::var_os("JARVUS_AGENT_DESKTOP_BIN") {
+    if let Some(path) = env::var_os("RHEA_AGENT_DESKTOP_BIN") {
         let path = PathBuf::from(path);
         if path.is_file() {
             return Ok(path);
         }
         return Err(format!(
-            "JARVUS_AGENT_DESKTOP_BIN points to a missing file: {}",
+            "RHEA_AGENT_DESKTOP_BIN points to a missing file: {}",
             path.display()
         ));
     }
@@ -2942,7 +3037,7 @@ fn resolve_binary() -> Result<PathBuf, String> {
             return Ok(arm_binary);
         }
     }
-    Err("agent-desktop was not found. Install it with `npm install -g agent-desktop` (or `brew install agent-desktop` on macOS), or set JARVUS_AGENT_DESKTOP_BIN to its native executable.".to_owned())
+    Err("agent-desktop was not found. Install it with `npm install -g agent-desktop` (or `brew install agent-desktop` on macOS), or set RHEA_AGENT_DESKTOP_BIN to its native executable.".to_owned())
 }
 
 /// Where a CLI can live on macOS/Linux even though a GUI app inherits only a bare PATH:
@@ -2953,7 +3048,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
             directories.push(dir.to_path_buf());
-            // JARVUS.app/Contents/MacOS/jarvus -> JARVUS.app/Contents/Resources
+            // Rhea.app/Contents/MacOS/rhea -> Rhea.app/Contents/Resources
             directories.push(dir.join("../Resources"));
         }
     }
@@ -2972,7 +3067,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Open Agent Desktop's own macOS permission guide. This is the supported
-/// upstream flow for Accessibility and Screen Recording grants; JARVUS does
+/// upstream flow for Accessibility and Screen Recording grants; Rhea does
 /// not implement a parallel accessibility engine or manipulate TCC settings.
 pub fn permissions_guide() -> Result<Value, String> {
     #[cfg(target_os = "macos")]
@@ -3012,6 +3107,63 @@ pub fn permission_status() -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hint(reference: &str, role: &str, name: &str) -> ElementHint {
+        ElementHint { reference: Some(reference.into()), role: role.into(), name: name.into(), bounds: None }
+    }
+
+    fn context(snapshot_id: &str, elements: Vec<ElementHint>) -> SnapshotContext {
+        SnapshotContext {
+            snapshot_id: snapshot_id.into(),
+            app: Some("Notes".into()),
+            window_id: None,
+            surface: "window".into(),
+            complete: true,
+            bounds: None,
+            elements,
+            raw_tree: None,
+            raw_tree_bytes: 0,
+            captured_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn a_cut_off_window_never_proves_a_control_is_absent() {
+        assert!(tree_truncated(&json!({"role": "window", "truncated": true})));
+        assert!(!tree_truncated(&json!({"role": "window"})));
+        let note = with_truncation_note("Nothing visible matches 'Save'.".into(), true);
+        assert!(note.starts_with("Nothing visible matches 'Save'.") && note.contains("more controls than were read"), "{note}");
+        assert_eq!(with_truncation_note("Nothing.".into(), false), "Nothing.");
+    }
+
+    #[test]
+    fn a_stale_ref_is_found_again_only_when_one_control_matches() {
+        let old = context("s1", vec![hint("@s1:e1", "button", "Save"), hint("@s1:e2", "button", "Cancel")]);
+        let moved = context("s2", vec![hint("@s2:e7", "button", "  save "), hint("@s2:e8", "button", "Cancel")]);
+        assert_eq!(re_resolve_ref(&old, "@s1:e1", &moved).as_deref(), Some("@s2:e7"));
+
+        let twice = context("s2", vec![hint("@s2:e1", "button", "Save"), hint("@s2:e2", "button", "Save")]);
+        assert_eq!(re_resolve_ref(&old, "@s1:e1", &twice), None, "two matches: the model decides");
+        let gone = context("s2", vec![hint("@s2:e1", "button", "Cancel")]);
+        assert_eq!(re_resolve_ref(&old, "@s1:e1", &gone), None);
+        let other_role = context("s2", vec![hint("@s2:e1", "link", "Save")]);
+        assert_eq!(re_resolve_ref(&old, "@s1:e1", &other_role), None);
+        assert_eq!(re_resolve_ref(&old, "@s1:e1", &old), None, "the same snapshot is not newer");
+        assert_eq!(re_resolve_ref(&old, "@s1:e9", &moved), None, "an unknown ref");
+    }
+
+    #[test]
+    fn a_control_without_a_label_is_never_retried_by_guessing() {
+        let old = context("s1", vec![hint("@s1:e1", "button", "")]);
+        let fresh = context("s2", vec![hint("@s2:e1", "button", "")]);
+        assert_eq!(re_resolve_ref(&old, "@s1:e1", &fresh), None);
+    }
+
+    #[test]
+    fn only_repeatable_actions_are_retried() {
+        assert!(retry_on_fresh_ref("click") && retry_on_fresh_ref("scroll") && retry_on_fresh_ref("hover"));
+        assert!(!retry_on_fresh_ref("type") && !retry_on_fresh_ref("send") && !retry_on_fresh_ref("press"));
+    }
 
     #[test]
     fn app_snapshot_defaults_are_full_uncompacted_and_deep() {
@@ -3514,8 +3666,8 @@ mod tests {
     #[test]
     #[ignore]
     fn live_locate_against_saved_tree() {
-        // JARVUS_TREE=<agent-desktop snapshot json> cargo test --bin jarvus live_locate -- --ignored --nocapture
-        let path = std::env::var("JARVUS_TREE").unwrap();
+        // RHEA_TREE=<agent-desktop snapshot json> cargo test --bin rhea live_locate -- --ignored --nocapture
+        let path = std::env::var("RHEA_TREE").unwrap();
         let snapshot: Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let tree = snapshot.pointer("/data/tree").unwrap();

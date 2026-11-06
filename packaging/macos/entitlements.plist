@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <!-- Lets JARVUS drive other apps through AppleScript / System Events once the user approves it. -->
+  <!-- Lets Rhea drive other apps through AppleScript / System Events once the user approves it. -->
   <key>com.apple.security.automation.apple-events</key><true/>
 </dict>
 </plist>

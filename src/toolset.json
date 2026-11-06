@@ -14,7 +14,7 @@
   {
     "type": "function",
     "name": "jev_run_plan",
-    "description": "Use for local desktop action sequences. JEV runs the bounded steps and returns their results; ChatGPT must inspect those results and continue when the user goal spans multiple actions. A research, search, count, threshold, comparison, or summary task must return to ChatGPT for verification and next steps. Multi-step plans always return to ChatGPT, even if final=true is requested; the app enforces this. Only a single mechanical action with an observable successful result may finish locally. Never treat a plan's completed status alone as proof of a research goal. For web research, use browser search/extract tools, gather the requested number/threshold of sourced results, then summarize only what was observed. Targets are visible labels; JEV resolves them from fresh app state. If a step fails, nothing later runs; use the returned state to continue without repeating completed work. Never resend after message_sent is true. Shell step: shell{text: the command, target: working directory (null = home), keys: 'detach' to run it in the background (servers, installer windows, launching a program), ms: timeout in ms (default 120000, max 900000)}; a nonzero exit stops the plan and returns stdout/stderr so you can re-plan. Mix freely with GUI steps, e.g. shell winget install -> open_app -> click 'Next' (within dialog) -> wait 'Finish', all in one plan.",
+    "description": "Use for local desktop action sequences. Rhea runs the bounded steps and returns their results; ChatGPT must inspect those results and continue when the user goal spans multiple actions. A research, search, count, threshold, comparison, or summary task must return to ChatGPT for verification and next steps. Multi-step plans always return to ChatGPT, even if final=true is requested; the app enforces this. Only a single mechanical action with an observable successful result may finish locally. Never treat a plan's completed status alone as proof of a research goal. For web research, use browser search/extract tools, gather the requested number/threshold of sourced results, then summarize only what was observed. Targets are visible labels; Rhea resolves them from fresh app state. If a step fails, nothing later runs; use the returned state to continue without repeating completed work. Never resend after message_sent is true. Shell step: shell{text: the command, target: working directory (null = home), keys: 'detach' to run it in the background (servers, installer windows, launching a program), ms: timeout in ms (default 120000, max 900000)}; a nonzero exit stops the plan and returns stdout/stderr so you can re-plan. Mix freely with GUI steps, e.g. shell winget install -> open_app -> click 'Next' (within dialog) -> wait 'Finish', all in one plan.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -253,7 +253,7 @@
   {
     "type": "function",
     "name": "desktop_launch",
-    "description": "Open or focus the named app using JEV's exact-app resolver. JEV returns a fresh compact snapshot after launch/focus; use desktop_list_windows only to disambiguate multiple windows.",
+    "description": "Open or focus the named app using Rhea's exact-app resolver. Rhea returns a fresh compact snapshot after launch/focus; use desktop_list_windows only to disambiguate multiple windows.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -271,7 +271,7 @@
   {
     "type": "function",
     "name": "desktop_focus_window",
-    "description": "Focus an observed app window by a current window ID, app name, or title. Supply null for identifiers not used. JEV verifies focus and returns a fresh compact snapshot.",
+    "description": "Focus an observed app window by a current window ID, app name, or title. Supply null for identifiers not used. Rhea verifies focus and returns a fresh compact snapshot.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -306,7 +306,7 @@
   {
     "type": "function",
     "name": "desktop_snapshot",
-    "description": "Read a fresh, full Agent Desktop accessibility tree for the selected app/window or focused UI. Defaults: interactive_only=false, compact=false, skeleton=false, filter=all, max_depth=32, timeout_ms=30000. JEV retains the full returned tree locally and returns only a bounded refs/roles/safe-label summary to ChatGPT. If you know a visible target label (for example a DM name), pass target_text so matching refs are prioritized. When target_resolution.status is resolved, use its unique same-snapshot action_ref; when unresolved, do not guess and inspect its reason/candidates. JEV maps a label to a clickable ancestor only when exactly one matching label and one same-snapshot actionable ancestor exist in a complete retained tree. Use a filter or interactive_only only when explicitly useful; these can hide static row labels. Screenshot pixels and editable field values are never included in the model summary.",
+    "description": "Read a fresh, full Agent Desktop accessibility tree for the selected app/window or focused UI. Defaults: interactive_only=false, compact=false, skeleton=false, filter=all, max_depth=32, timeout_ms=30000. Rhea retains the full returned tree locally and returns only a bounded refs/roles/safe-label summary to ChatGPT. If you know a visible target label (for example a DM name), pass target_text so matching refs are prioritized. When target_resolution.status is resolved, use its unique same-snapshot action_ref; when unresolved, do not guess and inspect its reason/candidates. Rhea maps a label to a clickable ancestor only when exactly one matching label and one same-snapshot actionable ancestor exist in a complete retained tree. Use a filter or interactive_only only when explicitly useful; these can hide static row labels. Screenshot pixels and editable field values are never included in the model summary.",
     "strict": false,
     "parameters": {
       "type": "object",
@@ -407,7 +407,7 @@
   {
     "type": "function",
     "name": "desktop_find",
-    "description": "Find a visible accessibility element by text, name, or role in the selected app/window when the latest snapshot omits the target or leaves it ambiguous. Prefer an existing ref from the latest snapshot to avoid a redundant search. Agent Desktop's Windows editable role is `textfield`; if `edit` finds nothing JEV retries `textfield`. JEV returns a compact result with safe labels and fresh qualified refs, not the raw search tree.",
+    "description": "Find a visible accessibility element by text, name, or role in the selected app/window when the latest snapshot omits the target or leaves it ambiguous. Prefer an existing ref from the latest snapshot to avoid a redundant search. Agent Desktop's Windows editable role is `textfield`; if `edit` finds nothing Rhea retries `textfield`. Rhea returns a compact result with safe labels and fresh qualified refs, not the raw search tree.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -486,7 +486,7 @@
   {
     "type": "function",
     "name": "desktop_click",
-    "description": "Activate one uniquely identified control from the latest JEV snapshot using native accessibility semantics (UI Automation on Windows, the Accessibility API on macOS) so the intended control can receive focus without forcing a physical pointer click. JEV checks delivery and returns a fresh compact snapshot of the same app/window. Complete navigation to the intended destination before the send sequence; after desktop_send is called, do not click as a fallback. Use desktop_mouse_click only when a physical coordinate click is specifically needed.",
+    "description": "Activate one uniquely identified control from the latest Rhea snapshot using native accessibility semantics (UI Automation on Windows, the Accessibility API on macOS) so the intended control can receive focus without forcing a physical pointer click. Rhea checks delivery and returns a fresh compact snapshot of the same app/window. Complete navigation to the intended destination before the send sequence; after desktop_send is called, do not click as a fallback. Use desktop_mouse_click only when a physical coordinate click is specifically needed.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -504,7 +504,7 @@
   {
     "type": "function",
     "name": "desktop_type",
-    "description": "Type user-provided text into a control identified by a fresh qualified ref only when the user asked for text entry without submission. Supply the snapshot_id returned with that ref. On Windows, JEV uses headed Agent Desktop input so it targets the selected control in the exact app window; JEV checks delivery and returns a fresh compact snapshot without echoing typed content. For an explicitly authorized send use desktop_send; do not call desktop_type, desktop_get, desktop_press, or desktop_click as a fallback after desktop_send, even when its result is unverified.",
+    "description": "Type user-provided text into a control identified by a fresh qualified ref only when the user asked for text entry without submission. Supply the snapshot_id returned with that ref. On Windows, Rhea uses headed Agent Desktop input so it targets the selected control in the exact app window; Rhea checks delivery and returns a fresh compact snapshot without echoing typed content. For an explicitly authorized send use desktop_send; do not call desktop_type, desktop_get, desktop_press, or desktop_click as a fallback after desktop_send, even when its result is unverified.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -533,7 +533,7 @@
   {
     "type": "function",
     "name": "desktop_send",
-    "description": "Sole send path for exact user-authorized text. After a fresh observation confirms the intended destination and one unique editable composer, call desktop_send once with that snapshot_id, ref, and exact text. It verifies delivery, then presses Return at most once using the fresh post-type snapshot. If typing is unverified, JEV stops without submitting; if Return is uncertain, use the returned observation to report status and never fall back to desktop_type, desktop_get, desktop_press, desktop_click, or another desktop_send. The private field value is never echoed.",
+    "description": "Sole send path for exact user-authorized text. After a fresh observation confirms the intended destination and one unique editable composer, call desktop_send once with that snapshot_id, ref, and exact text. It verifies delivery, then presses Return at most once using the fresh post-type snapshot. If typing is unverified, Rhea stops without submitting; if Return is uncertain, use the returned observation to report status and never fall back to desktop_type, desktop_get, desktop_press, desktop_click, or another desktop_send. The private field value is never echoed.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -560,7 +560,7 @@
   {
     "type": "function",
     "name": "desktop_press",
-    "description": "Send one allowlisted key to the exact app/window represented by the latest snapshot_id. JEV checks delivery and returns a fresh compact snapshot. Use Return to submit only for a distinct user-authorized submission that is not being handled by desktop_send. Never use desktop_press as a fallback after desktop_send.",
+    "description": "Send one allowlisted key to the exact app/window represented by the latest snapshot_id. Rhea checks delivery and returns a fresh compact snapshot. Use Return to submit only for a distinct user-authorized submission that is not being handled by desktop_send. Never use desktop_press as a fallback after desktop_send.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -604,7 +604,7 @@
   {
     "type": "function",
     "name": "desktop_mouse_move",
-    "description": "Move the real cursor to an absolute point inside the target window bounds from a fresh snapshot. Requires the current snapshot_id and coordinates within its bounds. JEV returns a fresh compact observation afterward.",
+    "description": "Move the real cursor to an absolute point inside the target window bounds from a fresh snapshot. Requires the current snapshot_id and coordinates within its bounds. Rhea returns a fresh compact observation afterward.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -630,7 +630,7 @@
   {
     "type": "function",
     "name": "desktop_mouse_click",
-    "description": "Physically left-click one absolute point inside the target window bounds from a fresh snapshot. Requires its current snapshot_id and in-window coordinates. JEV checks delivery and returns a fresh compact observation; never repeat an uncertain click without inspecting it.",
+    "description": "Physically left-click one absolute point inside the target window bounds from a fresh snapshot. Requires its current snapshot_id and in-window coordinates. Rhea checks delivery and returns a fresh compact observation; never repeat an uncertain click without inspecting it.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -656,7 +656,7 @@
   {
     "type": "function",
     "name": "desktop_hover",
-    "description": "Move the cursor over a control identified by a fresh qualified ref. JEV returns a fresh compact snapshot so hover menus and tooltips can be inspected.",
+    "description": "Move the cursor over a control identified by a fresh qualified ref. Rhea returns a fresh compact snapshot so hover menus and tooltips can be inspected.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -674,7 +674,7 @@
   {
     "type": "function",
     "name": "desktop_scroll",
-    "description": "Scroll one observed accessibility element by 1 to 10 units. JEV checks delivery and returns a fresh compact snapshot for the same app/window.",
+    "description": "Scroll one observed accessibility element by 1 to 10 units. Rhea checks delivery and returns a fresh compact snapshot for the same app/window.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -779,7 +779,7 @@
   {
     "type": "function",
     "name": "list_mcps",
-    "description": "Always-available. Lists every connection with its LIVE health status (connected, disconnected, unauthorized, error, disabled): configured MCP servers, the built-in Chrome browser bridge (id \"chrome\", not an MCP server) and built-in JARVUS Shell. Call it when you need to know which MCPs exist or whether one is usable. The answer_hint field is a plain-language summary; do not omit Chrome when answering which integrations are connected. Secret values are never returned. Chrome and MCP tools are NOT loaded until you call get_tools_.",
+    "description": "Always-available. Lists every connection with its LIVE health status (connected, disconnected, unauthorized, error, disabled): configured MCP servers, the built-in Chrome browser bridge (id \"chrome\", not an MCP server) and built-in Rhea Shell. Call it when you need to know which MCPs exist or whether one is usable. The answer_hint field is a plain-language summary; do not omit Chrome when answering which integrations are connected. Secret values are never returned. Chrome and MCP tools are NOT loaded until you call get_tools_.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -1052,7 +1052,7 @@
   {
     "type": "function",
     "name": "install_skill",
-    "description": "Install a skill from GitHub into ~/.jarvus/skills when the user asks for it. source = a link to the skill folder or its SKILL.md (https://github.com/owner/repo/tree/main/skills/name), or a repo link (then it lists the skills inside). Returns the installed name.",
+    "description": "Install a skill from GitHub into ~/.rhea/skills when the user asks for it. source = a link to the skill folder or its SKILL.md (https://github.com/owner/repo/tree/main/skills/name), or a repo link (then it lists the skills inside). Returns the installed name.",
     "strict": true,
     "parameters": {
       "type": "object",
@@ -1074,6 +1074,104 @@
         "name"
       ],
       "additionalProperties": false
+    }
+  },
+  {
+    "type": "function",
+    "name": "laya_decide",
+    "description": "Ask Laya, Rhea's fast local decision model, one or more typed questions about a situation. It answers in well under a second with calibrated probabilities and without a ChatGPT round trip, so use it for quick classification or choosing among options (which candidate matches, is this risky, which category). Question types: choice (criteria = {option: description}), score (criteria = list of levels) and noul (a yes/no question). If the model is not installed it says so; the user installs it in Settings > Local model.",
+    "strict": false,
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": [
+            "string",
+            "object"
+          ],
+          "description": "The situation to decide about: plain text or a JSON object with the facts."
+        },
+        "questions": {
+          "type": "object",
+          "description": "Question name -> {type: \"choice\"|\"score\"|\"noul\", instructions: string, criteria: object|array}"
+        }
+      },
+      "required": [
+        "state",
+        "questions"
+      ]
+    }
+  },
+  {
+    "type": "function",
+    "name": "memory_search",
+    "strict": false,
+    "description": "Search Rhea's long-term memory across every chat: what the user told you (preferences, instructions, decisions), what was actually done (verified outcomes and failures from tool results), how problems were solved, and unfinished work. A short Memory note is already added to each run; use this when you need more, or to check what happened earlier. Results carry an id, kind, age and whether the outcome was verified.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "What to look for, in plain words"
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional filter: preference, instruction, fact, decision, outcome, failure, workflow, summary, task, note"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Up to 20; default 6"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "type": "function",
+    "name": "memory_remember",
+    "strict": false,
+    "description": "Save something worth keeping for future chats when it is not already obvious from what the user said (their statements are saved automatically). Use it for a decision reached together, a lesson learned the hard way, or a convention of a project. Never store secrets. The user can review and delete memories in Settings > Memory.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "One self-contained sentence or two"
+        },
+        "kind": {
+          "type": "string",
+          "description": "preference | instruction | fact | decision | task | note"
+        },
+        "scope": {
+          "type": "string",
+          "description": "global (default) or a project name"
+        }
+      },
+      "required": [
+        "text"
+      ]
+    }
+  },
+  {
+    "type": "function",
+    "name": "memory_forget",
+    "strict": false,
+    "description": "Delete one memory by id (from memory_search) when the user asks you to forget it or it is wrong.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ]
     }
   }
 ]

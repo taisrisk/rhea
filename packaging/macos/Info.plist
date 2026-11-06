@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
-  <key>CFBundleExecutable</key><string>jarvus</string>
-  <key>CFBundleIconFile</key><string>jarvus</string>
-  <key>CFBundleIdentifier</key><string>com.jarvus.desktop</string>
+  <key>CFBundleExecutable</key><string>rhea</string>
+  <key>CFBundleIconFile</key><string>rhea</string>
+  <key>CFBundleIdentifier</key><string>com.rhea.desktop</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleName</key><string>JARVUS</string>
-  <key>CFBundleDisplayName</key><string>JARVUS</string>
+  <key>CFBundleName</key><string>Rhea</string>
+  <key>CFBundleDisplayName</key><string>Rhea</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>@VERSION@</string>
   <key>CFBundleVersion</key><string>@VERSION@</string>
@@ -16,14 +16,14 @@
   <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
-  <key>NSHumanReadableCopyright</key><string>JARVUS</string>
+  <key>NSHumanReadableCopyright</key><string>Rhea</string>
   <key>NSAppleEventsUsageDescription</key>
-  <string>JARVUS asks other apps to open, focus and report their windows when you ask it to work with them.</string>
+  <string>Rhea asks other apps to open, focus and report their windows when you ask it to work with them.</string>
   <key>NSDesktopFolderUsageDescription</key>
-  <string>JARVUS reads and writes files in your Desktop folder when you ask it to.</string>
+  <string>Rhea reads and writes files in your Desktop folder when you ask it to.</string>
   <key>NSDocumentsFolderUsageDescription</key>
-  <string>JARVUS reads and writes files in your Documents folder when you ask it to.</string>
+  <string>Rhea reads and writes files in your Documents folder when you ask it to.</string>
   <key>NSDownloadsFolderUsageDescription</key>
-  <string>JARVUS reads and writes files in your Downloads folder when you ask it to.</string>
+  <string>Rhea reads and writes files in your Downloads folder when you ask it to.</string>
 </dict>
 </plist>

@@ -1,7 +1,7 @@
 //! Chrome Native Messaging host and authenticated local command relay.
 //!
 //! Chrome starts this process with the calling extension origin as argv[1]. The
-//! extension keeps the native port open. JARVUS sends commands to the host's
+//! extension keeps the native port open. Rhea sends commands to the host's
 //! loopback relay (see `chrome-extension/README.md`); the host forwards those
 //! commands over the native port and returns the extension's verified result.
 
@@ -27,7 +27,10 @@ const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const RELAY_REPLY_TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_RELAY_CONNECTIONS: usize = 16;
-const HOST_NAME: &str = "com.jarvus.browser";
+const HOST_NAME: &str = "com.rhea.browser";
+/// What earlier versions called the native host. The extension Chrome already has loaded still
+/// asks for this name until it is reloaded from the new folder, so it is registered too.
+const LEGACY_HOST_NAME: &str = "com.jarvus.browser";
 /// ID of the bundled extension, pinned by the public "key" in
 /// chrome-extension/manifest.json (so an unpacked install always gets it).
 pub const BUNDLED_EXTENSION_ID: &str = "eplppddfejfcbdllfbooenaplkobcpkk";
@@ -73,7 +76,7 @@ pub struct BrowserRelayConfig {
     pub expires_at_epoch_ms: u128,
 }
 
-/// Path shared by the Chrome-started native host and the JARVUS application.
+/// Path shared by the Chrome-started native host and the Rhea application.
 pub fn relay_config_path() -> Result<PathBuf, BrowserHostError> {
     crate::chat_store::app_data_root()
         .map(|root| root.join("browser-relay.json"))
@@ -251,9 +254,9 @@ pub fn stop_browser_relay() -> Result<(), BrowserHostError> {
     Ok(())
 }
 
-/// Run when `jarvus.exe` is invoked as Chrome's native messaging host.
+/// Run when `rhea.exe` is invoked as Chrome's native messaging host.
 ///
-/// `JARVUS_CHROME_EXTENSION_ID` must contain the exact 32-character unpacked or
+/// `RHEA_CHROME_EXTENSION_ID` must contain the exact 32-character unpacked or
 /// published Chrome extension ID registered in Chrome's native-host manifest.
 pub fn run_native_messaging_host() -> Result<(), BrowserHostError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -264,7 +267,7 @@ pub fn run_native_messaging_host() -> Result<(), BrowserHostError> {
     }
     .ok_or_else(|| BrowserHostError("Chrome extension origin is missing from argv[1]".into()))?
     .to_string();
-    let expected_id = env::var("JARVUS_CHROME_EXTENSION_ID")
+    let expected_id = env::var("RHEA_CHROME_EXTENSION_ID")
         .ok()
         .filter(|id| valid_extension_id(id))
         .unwrap_or_else(|| BUNDLED_EXTENSION_ID.to_owned());
@@ -451,14 +454,14 @@ fn start_relay_listener(
     );
     session.write_descriptor(&endpoint, token)?;
     eprintln!(
-        "JARVUS browser relay listening on loopback (session file: {})",
+        "Rhea browser relay listening on loopback (session file: {})",
         session.path.display()
     );
 
     let expected_token = token.to_string();
     let active = Arc::new(AtomicUsize::new(0));
     thread::Builder::new()
-        .name("jarvus-browser-relay".into())
+        .name("rhea-browser-relay".into())
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {
@@ -481,7 +484,7 @@ fn start_relay_listener(
                         let writer = writer.clone();
                         let active_worker = active.clone();
                         let worker = thread::Builder::new()
-                            .name("jarvus-browser-relay-request".into())
+                            .name("rhea-browser-relay-request".into())
                             .spawn(move || {
                                 let mut stream = stream;
                                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -659,24 +662,29 @@ fn validate_command_params(method: &str, params: &Value) -> Result<(), String> {
 
 /// Register the bundled extension's native messaging host for this Windows
 /// user: write the host manifest next to the app data and point Chrome's
-/// per-user registry key at it. Idempotent; runs at every JARVUS start so the
+/// per-user registry key at it. Idempotent; runs at every Rhea start so the
 /// path follows the current executable.
 pub fn ensure_native_host_registered() -> Result<String, BrowserHostError> {
+    let _ = register_host(LEGACY_HOST_NAME);
+    register_host(HOST_NAME)
+}
+
+fn register_host(host_name: &str) -> Result<String, BrowserHostError> {
     let exe = env::current_exe()?;
     let directory = crate::chat_store::app_data_root()
         .ok_or_else(|| BrowserHostError("The user home directory is not set".into()))?;
     fs::create_dir_all(&directory)?;
-    let manifest_path = directory.join(format!("{HOST_NAME}.json"));
+    let manifest_path = directory.join(format!("{host_name}.json"));
     let mut origins = vec![format!("chrome-extension://{BUNDLED_EXTENSION_ID}/")];
-    if let Some(custom) = env::var("JARVUS_CHROME_EXTENSION_ID")
+    if let Some(custom) = env::var("RHEA_CHROME_EXTENSION_ID")
         .ok()
         .filter(|id| valid_extension_id(id) && id != BUNDLED_EXTENSION_ID)
     {
         origins.push(format!("chrome-extension://{custom}/"));
     }
     let manifest = json!({
-        "name": HOST_NAME,
-        "description": "JARVUS local browser-control bridge",
+        "name": host_name,
+        "description": "Rhea local browser-control bridge",
         "path": exe.to_string_lossy(),
         "type": "stdio",
         "allowed_origins": origins,
@@ -688,7 +696,7 @@ pub fn ensure_native_host_registered() -> Result<String, BrowserHostError> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let key = format!(r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{HOST_NAME}");
+        let key = format!(r"HKCU\Software\Google\Chrome\NativeMessagingHosts\{host_name}");
         let target = manifest_path.to_string_lossy().to_string();
         let current = std::process::Command::new("reg")
             .args(["query", &key, "/ve"])
@@ -709,7 +717,7 @@ pub fn ensure_native_host_registered() -> Result<String, BrowserHostError> {
     #[cfg(target_os = "macos")]
     {
         let home = directory.parent().ok_or_else(|| {
-            BrowserHostError("JARVUS data directory has no home directory".into())
+            BrowserHostError("Rhea data directory has no home directory".into())
         })?;
         let chrome_hosts = home
             .join("Library")
@@ -718,7 +726,7 @@ pub fn ensure_native_host_registered() -> Result<String, BrowserHostError> {
             .join("Chrome")
             .join("NativeMessagingHosts");
         fs::create_dir_all(&chrome_hosts)?;
-        let chrome_manifest = chrome_hosts.join(format!("{HOST_NAME}.json"));
+        let chrome_manifest = chrome_hosts.join(format!("{host_name}.json"));
         write_if_changed(&chrome_manifest, &bytes)?;
     }
     Ok(manifest_path.display().to_string())
@@ -885,7 +893,7 @@ fn next_command_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!(
-        "jarvus-{}-{}-{}",
+        "rhea-{}-{}-{}",
         std::process::id(),
         time,
         NEXT.fetch_add(1, Ordering::Relaxed)

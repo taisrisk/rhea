@@ -1,5 +1,5 @@
 //! The assistant side of the transcript: no bubble (the reply sits on the background beside the
-//! JARVUS mark), a compact "Worked for ..." section whose tool calls are grouped by kind
+//! Rhea mark), a compact "Worked for ..." section whose tool calls are grouped by kind
 //! ("Ran 4 commands"), and read-only selectable boxes for each call's arguments and result.
 
 use super::*;
@@ -13,13 +13,13 @@ struct Kind {
 
 fn tool_kind(name: &str) -> Kind {
     match name {
-        "mcp__jarvus_shell__run_command" => Kind { key: "command", verb: "Ran", plural: "commands" },
-        "mcp__jarvus_shell__read_file" => Kind { key: "read", verb: "Read", plural: "files" },
-        "mcp__jarvus_shell__write_file" | "mcp__jarvus_shell__edit_file" | "mcp__jarvus_shell__create_directory" => {
+        "mcp__rhea_shell__run_command" => Kind { key: "command", verb: "Ran", plural: "commands" },
+        "mcp__rhea_shell__read_file" => Kind { key: "read", verb: "Read", plural: "files" },
+        "mcp__rhea_shell__write_file" | "mcp__rhea_shell__edit_file" | "mcp__rhea_shell__create_directory" => {
             Kind { key: "edit", verb: "Changed", plural: "files and folders" }
         }
-        "mcp__jarvus_shell__list_directory" => Kind { key: "list", verb: "Listed", plural: "folders" },
-        "mcp__jarvus_shell__web_fetch" => Kind { key: "fetch", verb: "Fetched", plural: "pages" },
+        "mcp__rhea_shell__list_directory" => Kind { key: "list", verb: "Listed", plural: "folders" },
+        "mcp__rhea_shell__web_fetch" => Kind { key: "fetch", verb: "Fetched", plural: "pages" },
         "jev_run_plan" | "open_app" => Kind { key: "desktop", verb: "Ran", plural: "desktop plans" },
         n if n.starts_with("desktop_") => Kind { key: "desktop", verb: "Used", plural: "desktop actions" },
         n if n.starts_with("browser__") => Kind { key: "chrome", verb: "Used", plural: "Chrome actions" },
@@ -164,7 +164,51 @@ fn caret_icon(ui: &mut egui::Ui, openness: f32, response: &egui::Response) {
     paint_icon(ui.painter(), response.rect.shrink(1.0), if openness > 0.5 { "chevron" } else { "chevron_right" }, color);
 }
 
-impl JarvusApp {
+/// "0m 12s": the running clock shown while a command works.
+pub(super) fn format_clock(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1_000;
+    format!("{}m {}s", seconds / 60, seconds % 60)
+}
+
+impl RheaApp {
+    /// A slash command in the transcript: the command as the user's message, then Rhea's side
+    /// showing the running clock (`running_since`) or the outcome.
+    pub(super) fn command_note(&mut self, ui: &mut egui::Ui, position: usize, note: &ChatNote, running_since: Option<Instant>) {
+        ui.add_space(14.0);
+        ui.horizontal(|row| {
+            row.with_layout(egui::Layout::right_to_left(egui::Align::Min), |row| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(35, 37, 34))
+                    .stroke(egui::Stroke::new(1.0, LINE))
+                    .corner_radius(CornerRadius::same(16))
+                    .inner_margin(Margin { left: 15, right: 15, top: 11, bottom: 11 })
+                    .show(row, |bubble| {
+                        bubble.label(egui::RichText::new(&note.command).color(INK));
+                    });
+            });
+        });
+        ui.add_space(14.0);
+        ui.push_id(("command-note", position), |ui| {
+            ui.horizontal(|ui| {
+                brand_mark(ui, 22.0);
+            });
+            ui.add_space(5.0);
+            match running_since {
+                Some(started) => {
+                    let elapsed = started.elapsed().as_millis() as u64;
+                    ui.label(egui::RichText::new(format!("Compacting… it’s been {}", format_clock(elapsed))).color(HOVER_GREEN));
+                    ui.ctx().request_repaint_after(Duration::from_millis(250));
+                }
+                None => {
+                    ui.add(egui::Label::new(egui::RichText::new(&note.text).color(if note.failed { DANGER } else { INK })).wrap().selectable(true));
+                    if !note.detail.is_empty() {
+                        ui.add(egui::Label::new(egui::RichText::new(&note.detail).size(11.0).color(MUTED)).wrap().selectable(true));
+                    }
+                }
+            }
+        });
+    }
+
     pub(super) fn assistant_message(&mut self, ui: &mut egui::Ui, index: usize, turn: &Turn, last_turn: bool, chat_width: f32) {
         let detail_width = (chat_width * 0.5).clamp(260.0, 640.0);
         ui.vertical(|message| {
@@ -183,7 +227,7 @@ impl JarvusApp {
                 message.scope(|ui| {
                     ui.style_mut().visuals.override_text_color = Some(INK);
                     ui.style_mut().interaction.selectable_labels = true;
-                    CommonMarkViewer::new().show(ui, &mut self.markdown_cache, &preserve_line_breaks(&turn.content));
+                    CommonMarkViewer::new().show(ui, &mut self.markdown_cache, &preserve_line_breaks(&plain_dashes(&turn.content)));
                 });
             }
 
@@ -234,7 +278,7 @@ impl JarvusApp {
                 message.add_space(2.0);
                 message.horizontal(|actions| {
                     let copy = icon_button(actions, "copy", "Copy response", 34.0);
-                    if copy.clicked() { actions.ctx().copy_text(turn.content.clone()); self.notice = "Response copied to clipboard.".into(); }
+                    if copy.clicked() { actions.ctx().copy_text(plain_dashes(&turn.content)); self.notice = "Response copied to clipboard.".into(); }
                     let use_prompt = icon_button(actions, "use", "Use response as a prompt", 34.0);
                     if use_prompt.clicked() { self.draft = turn.content.clone(); }
                     if last_turn {
@@ -289,22 +333,22 @@ mod tests {
 
     #[test]
     fn one_kind_keeps_its_count() {
-        assert_eq!(turn_summary(&[call("mcp__jarvus_shell__run_command")]), "Ran a command");
-        let four: Vec<_> = (0..4).map(|_| call("mcp__jarvus_shell__run_command")).collect();
+        assert_eq!(turn_summary(&[call("mcp__rhea_shell__run_command")]), "Ran a command");
+        let four: Vec<_> = (0..4).map(|_| call("mcp__rhea_shell__run_command")).collect();
         assert_eq!(turn_summary(&four), "Ran 4 commands");
     }
 
     #[test]
     fn two_kinds_read_as_one_sentence_with_counts() {
-        let mut calls: Vec<_> = (0..4).map(|_| call("mcp__jarvus_shell__run_command")).collect();
-        calls.push(call("mcp__jarvus_shell__edit_file"));
-        calls.push(call("mcp__jarvus_shell__write_file"));
+        let mut calls: Vec<_> = (0..4).map(|_| call("mcp__rhea_shell__run_command")).collect();
+        calls.push(call("mcp__rhea_shell__edit_file"));
+        calls.push(call("mcp__rhea_shell__write_file"));
         assert_eq!(turn_summary(&calls), "Ran 4 commands and edited 2 files");
     }
 
     #[test]
     fn three_or_more_kinds_are_a_plain_comma_list_in_order_of_first_use() {
-        let calls = [call("mcp__jarvus_shell__edit_file"), call("mcp__jarvus_shell__run_command"), call("mcp__jarvus_shell__web_fetch"), call("mcp__jarvus_shell__run_command")];
+        let calls = [call("mcp__rhea_shell__edit_file"), call("mcp__rhea_shell__run_command"), call("mcp__rhea_shell__web_fetch"), call("mcp__rhea_shell__run_command")];
         assert_eq!(turn_summary(&calls), "Edited files, ran commands, searched the web");
         assert_eq!(turn_summary(&[]), "");
     }

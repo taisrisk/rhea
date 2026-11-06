@@ -7,6 +7,12 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::research::{
+    EvidenceLog, ResearchCompletion, requires_research_evidence, required_research_evidence_rows, research_blocker_reply, research_completion_gate,
+};
+#[cfg(test)]
+use crate::research::{evidence_fingerprint, requested_threshold, research_evidence_rows_from_tool};
+
 // ChatGPT subscription access uses the Codex account catalog and response route.
 const CODEX_CLIENT_VERSION: &str = "0.166.0";
 
@@ -19,8 +25,51 @@ pub struct Model {
     pub priority: Option<i64>,
     #[serde(default)]
     pub supported_reasoning_levels: Vec<String>,
+    /// The size the catalog recommends working in (272K for most models).
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// The most the ChatGPT backend accepts for this model on this account (`max_context_window`).
+    #[serde(default)]
+    pub max_context_window: Option<u64>,
+}
+
+impl Model {
+    /// The model's full context: the account's maximum, else the catalog's size, else what the
+    /// OpenAI model pages publish.
+    pub fn context_limit(&self) -> Option<u64> {
+        self.max_context_window.or(self.context_window).or_else(|| documented_limits(&self.slug).map(|limits| limits.context))
+    }
+
+    /// The most the model can write in one reply, from the OpenAI model pages.
+    pub fn max_output(&self) -> Option<u64> {
+        documented_limits(&self.slug).map(|limits| limits.max_output)
+    }
+}
+
+/// Limits published on https://developers.openai.com/api/docs/models (checked against each model's
+/// page). The context here is the API's; the ChatGPT backend can allow less, which is why the
+/// catalog's own `max_context_window` wins when it reports one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DocumentedLimits {
+    pub context: u64,
+    pub max_output: u64,
+}
+
+pub fn documented_limits(slug: &str) -> Option<DocumentedLimits> {
+    let slug = slug.to_ascii_lowercase();
+    let slug = slug.as_str();
+    let context = match slug {
+        "gpt-5.4-mini" | "gpt-5.4-nano" | "gpt-5.3-codex" | "gpt-5.2-codex" | "gpt-5" => 400_000,
+        "gpt-5.4" | "gpt-5.4-pro" => 1_050_000,
+        _ if slug.starts_with("gpt-6") || slug.starts_with("gpt-5.6") || slug.starts_with("gpt-5.5") => 1_050_000,
+        _ if slug.starts_with("gpt-5.2") || slug.starts_with("gpt-5.1") || slug.starts_with("gpt-5-") => 400_000,
+        _ => return None,
+    };
+    // Cyber variants are listed without figures.
+    if slug.contains("cyber") {
+        return None;
+    }
+    Some(DocumentedLimits { context, max_output: 128_000 })
 }
 
 pub fn models(access_token: &str, account_id: Option<&str>) -> Result<Vec<Model>, String> {
@@ -36,7 +85,7 @@ pub fn models(access_token: &str, account_id: Option<&str>) -> Result<Vec<Model>
         .header("originator", "codex_cli_rs")
         .header(
             reqwest::header::USER_AGENT,
-            format!("JARVUS/{}", env!("CARGO_PKG_VERSION")),
+            format!("Rhea/{}", env!("CARGO_PKG_VERSION")),
         );
     if let Some(id) = account_id {
         request = request.header("ChatGPT-Account-ID", id);
@@ -79,12 +128,16 @@ pub fn models(access_token: &str, account_id: Option<&str>) -> Result<Vec<Model>
                     })
                     .collect(),
                 context_window: model_context_window(m),
+                max_context_window: m
+                    .get("max_context_window")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value >= 16_000),
             })
         })
         .collect();
     if models.is_empty() {
         return Err(format!(
-            "ChatGPT returned {catalog_count} catalog entries, but none are marked available to the Codex API. JARVUS requests the Codex {CODEX_CLIENT_VERSION} catalog."
+            "ChatGPT returned {catalog_count} catalog entries, but none are marked available to the Codex API. Rhea requests the Codex {CODEX_CLIENT_VERSION} catalog."
         ));
     }
     Ok(models)
@@ -192,7 +245,7 @@ pub fn generate_title(
         .header("originator", "codex_cli_rs")
         .header(
             reqwest::header::USER_AGENT,
-            format!("JARVUS/{}", env!("CARGO_PKG_VERSION")),
+            format!("Rhea/{}", env!("CARGO_PKG_VERSION")),
         )
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .json(&title_request_body(model, &request_excerpt));
@@ -416,6 +469,8 @@ pub struct StreamEvent {
     pub error: Option<String>,
     pub usage: Option<Usage>,
     pub compaction: Option<CompactionUpdate>,
+    /// A short message for the status line (not part of the reply).
+    pub notice: Option<String>,
 }
 
 const STREAM_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -596,7 +651,17 @@ pub struct RunOptions {
     pub state: Option<crate::chat_store::ModelState>,
     /// Called when a run ends (finished, failed or cancelled) with the transcript to continue from.
     pub on_state: Option<Box<dyn Fn(crate::chat_store::ModelState) + Send>>,
+    /// Where this run writes its ledger (see `ledger.rs`); none means no record is kept.
+    pub ledger: Option<crate::ledger::Ledger>,
+    /// The Responses endpoint; the ChatGPT backend unless a test points it at a scripted server.
+    pub endpoint: Option<String>,
+    /// Fast mode: priority processing (about 1.5x speed, more usage).
+    pub fast: bool,
 }
+
+const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+/// What ChatGPT calls fast mode on the wire: priority processing.
+const FAST_SERVICE_TIER: &str = "priority";
 
 pub const DEFAULT_COMPACT_PERCENT: u8 = 80;
 pub const MIN_COMPACT_PERCENT: u8 = 15;
@@ -620,8 +685,7 @@ fn trim_old_tool_outputs(input: &mut [Value], keep_recent: usize) -> usize {
             continue;
         }
         let head: String = output.chars().take(600).collect();
-        item["output"] = json!(format!("{head}
-…[older tool result trimmed to save context; re-run the tool if you need the rest]"));
+        item["output"] = json!(format!("{head}\n…[older tool result trimmed to save context; re-run the tool if you need the rest]"));
         trimmed += 1;
     }
     trimmed
@@ -660,7 +724,9 @@ pub fn respond_with_options(
     send: impl Fn(StreamEvent),
 ) -> Result<String, String> {
     let on_state = options.on_state.take();
+    let ledger = options.ledger.take().unwrap_or_else(crate::ledger::Ledger::off);
     let mut run = RunState::default();
+    ledger.record(crate::ledger::Event::Start { model: model.to_owned(), request: user_message.chars().take(300).collect() });
     let result = respond_inner(
         access_token,
         account_id,
@@ -675,7 +741,19 @@ pub fn respond_with_options(
         options,
         &send,
         &mut run,
+        &ledger,
     );
+    let (status, error) = match &result {
+        Ok(_) => ("completed", String::new()),
+        Err(error) if error.contains("cancelled") => ("cancelled", error.clone()),
+        Err(error) => ("failed", error.clone()),
+    };
+    ledger.record(crate::ledger::Event::End {
+        status: status.into(),
+        ms: ledger.elapsed_ms(),
+        answer_chars: result.as_ref().map(|answer| answer.chars().count()).unwrap_or(0),
+        error: error.chars().take(300).collect(),
+    });
     // Hand the transcript back however the run ended, so a stopped or failed run is still remembered.
     if run.started {
         if let Some(save) = on_state {
@@ -719,6 +797,7 @@ fn respond_inner(
     mut options: RunOptions,
     send: &impl Fn(StreamEvent),
     run: &mut RunState,
+    ledger: &crate::ledger::Ledger,
 ) -> Result<String, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -826,8 +905,10 @@ fn respond_inner(
     let mut completion_diagnostics = "completion metadata unavailable".to_owned();
     let mut visible_delta_sent = false;
     let research_task = !options.worker && requires_research_evidence(user_message);
-    let mut research_evidence_rows = 0_usize;
+    // What this run has verified so far; the same page fetched twice is one source, not two.
+    let mut research_log = EvidenceLog::default();
     let mut evidence_retry_count = 0_u8;
+    let mut fast_on = options.fast;
 
     loop {
         if crate::jev::cancel_requested() {
@@ -861,7 +942,7 @@ fn respond_inner(
             }
         }
         let tools_for_round = request_tools(&tools, compose_active, &options.hidden_tools);
-        // Measure one ChatGPT round trip at a time. The total JEV task may
+        // Measure one ChatGPT round trip at a time. The total Rhea task may
         // include several model rounds and local tool execution, so it must
         // not be presented as a single model-request duration.
         let request_started = Instant::now();
@@ -874,27 +955,39 @@ fn respond_inner(
         } else {
             json!("auto")
         };
-        // This private ChatGPT backend refuses `store: true`, so JARVUS re-sends its
+        // This private ChatGPT backend refuses `store: true`, so Rhea re-sends its
         // persisted local history on each turn. The stable key is cache affinity, not a
         // server-issued conversation/session id and not a guarantee of server-held history.
-        let mut body = json!({"model":model,"reasoning":{"effort":reasoning_effort},"input":input,"tools":tools_for_round,"tool_choice":tool_choice,"parallel_tool_calls":false,"store":false,"stream":true});
-        if let Some(session) = options.session_id.as_deref() {
-            body["prompt_cache_key"] = json!(session);
-        }
-        let mut request = stream_http.post("https://chatgpt.com/backend-api/codex/responses")
-            .bearer_auth(access_token)
-            .header("originator", "codex_cli_rs")
-            .header(reqwest::header::USER_AGENT, format!("JARVUS/{}", env!("CARGO_PKG_VERSION")))
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&body);
-        if let Some(session) = options.session_id.as_deref() {
-            request = request.header("session_id", session);
-        }
-        if let Some(id) = account_id {
-            request = request.header("ChatGPT-Account-ID", id);
-        }
-        let mut response =
-            send_chat_request_with_cancel(&runtime, request, crate::jev::cancel_requested)?;
+        let mut response = loop {
+            let mut body = json!({"model":model,"reasoning":{"effort":reasoning_effort},"input":input,"tools":tools_for_round,"tool_choice":tool_choice,"parallel_tool_calls":false,"store":false,"stream":true});
+            if let Some(session) = options.session_id.as_deref() {
+                body["prompt_cache_key"] = json!(session);
+            }
+            if fast_on {
+                body["service_tier"] = json!(FAST_SERVICE_TIER);
+            }
+            let mut request = stream_http.post(options.endpoint.as_deref().unwrap_or(RESPONSES_URL))
+                .bearer_auth(access_token)
+                .header("originator", "codex_cli_rs")
+                .header(reqwest::header::USER_AGENT, format!("Rhea/{}", env!("CARGO_PKG_VERSION")))
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .json(&body);
+            if let Some(session) = options.session_id.as_deref() {
+                request = request.header("session_id", session);
+            }
+            if let Some(id) = account_id {
+                request = request.header("ChatGPT-Account-ID", id);
+            }
+            match send_chat_request_with_cancel(&runtime, request, crate::jev::cancel_requested) {
+                // The backend does not take fast mode for this model or account: go on at normal
+                // speed, and say so once instead of failing the run.
+                Err(error) if fast_on && error.contains("service_tier") => {
+                    fast_on = false;
+                    send(StreamEvent { notice: Some("Fast mode is not available for this model or account; continuing at normal speed.".into()), ..Default::default() });
+                }
+                other => break other?,
+            }
+        };
 
         let mut completed_output: Option<Vec<Value>> = None;
         let mut buffered_research_text = String::new();
@@ -1006,6 +1099,7 @@ fn respond_inner(
             .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
             .cloned()
             .collect();
+        ledger.record(crate::ledger::Event::Model { ms: request_started.elapsed().as_millis() as u64, tokens: last_input_tokens, calls: calls.len() });
         if calls.is_empty() {
             if let Some(hold) = options.hold_for_team.as_ref() {
                 let notes = hold();
@@ -1017,20 +1111,25 @@ fn respond_inner(
                     continue;
                 }
             }
-            match research_completion_gate(
-                research_task,
-                research_evidence_rows,
-                required_research_evidence_rows(user_message),
-                evidence_retry_count,
-            ) {
+            let required_rows = required_research_evidence_rows(user_message);
+            let gate = research_completion_gate(research_task, research_log.rows(), required_rows, evidence_retry_count);
+            if research_task {
+                let decision = match gate {
+                    ResearchCompletion::Accept => "accept",
+                    ResearchCompletion::Retry => "retry",
+                    ResearchCompletion::Block => "block",
+                };
+                ledger.record(crate::ledger::Event::Gate { decision: decision.into(), have: research_log.rows(), need: required_rows });
+            }
+            match gate {
                 ResearchCompletion::Retry => {
                     evidence_retry_count = evidence_retry_count.saturating_add(1);
                     input.extend(output);
-                    input.push(json!({"role":"developer","content":"Completion gate: this is an explicit research or current-data request, and the verified source/search evidence collected so far does not meet the user's requested threshold or result count. Do not present a promise or unsupported findings as completion. Use available browser or MCP search/extract tools to fill the remaining evidence requirement. If no such tool is available or it fails, give a concise truthful blocker and say what could not be verified."}));
+                    input.push(json!({"role":"developer","content":format!("Completion gate: this is an explicit research or current-data request, and the verified source/search evidence collected so far does not meet the user's requested threshold or result count. Verified so far: {} of the {} needed ({}). Do not present a promise or unsupported findings as completion. Use available browser or MCP search/extract tools to fill the remaining evidence requirement. If no such tool is available or it fails, give a concise truthful blocker and say what could not be verified.", research_log.rows(), required_rows, research_log.digest())}));
                     continue;
                 }
                 ResearchCompletion::Block => {
-                    let blocker = research_blocker_reply();
+                    let blocker = research_blocker_reply(&research_log, required_rows);
                     send(StreamEvent {
                         delta: Some(blocker.clone()),
                         ..Default::default()
@@ -1109,7 +1208,7 @@ fn respond_inner(
 
 ".into()), ..Default::default() });
         }
-        // JEV finishing ChatGPT's plan ends the turn here with the reply ChatGPT
+        // Rhea finishing ChatGPT's plan ends the turn here with the reply ChatGPT
         // wrote up front, so a successful task costs exactly one model request.
         let single_call = calls.len() == 1;
         let mut local_finish: Option<String> = None;
@@ -1132,7 +1231,7 @@ fn respond_inner(
                 .map_err(|e| format!("Invalid arguments for {name}: {e}"))?;
             // The model's `final` bit is a hint, never proof that a research or
             // multi-step request is complete. Keep those plans in the Responses
-            // loop so ChatGPT receives JEV's compact result and can verify,
+            // loop so ChatGPT receives Rhea's compact result and can verify,
             // gather more evidence, or continue the work.
             let arguments = if name == "jev_run_plan" {
                 enforce_plan_supervision(&parsed_arguments, user_message)
@@ -1157,6 +1256,7 @@ fn respond_inner(
                 tool_activity: Some(activity.clone()),
                 ..Default::default()
             });
+            let tool_started = Instant::now();
             let gate_error = if options.hidden_tools.iter().any(|hidden| hidden == name) {
                 Some(format!("`{name}` is not available to you in this run."))
             } else if compose_active {
@@ -1179,7 +1279,7 @@ fn respond_inner(
             } else if should_block_desktop_send_followup(name, desktop_send_attempted) {
                 json!({"ok":false,"error":"desktop_send already ran for this request. Do not repeat or fall back to separate typing, readback, key, or click actions; use the returned status and fresh observation."})
             } else if should_block_low_level_send_input(name, explicit_send_requested) {
-                json!({"ok":false,"error":"This request explicitly asks JEV to send a message. Use desktop_send with the fresh unique composer ref and exact user-authorized text; separate typing or key submission is unavailable."})
+                json!({"ok":false,"error":"This request explicitly asks Rhea to send a message. Use desktop_send with the fresh unique composer ref and exact user-authorized text; separate typing or key submission is unavailable."})
             } else {
                 if name == "desktop_send" {
                     desktop_send_attempted = true;
@@ -1225,15 +1325,16 @@ fn respond_inner(
                 }
                 result
             };
-            research_evidence_rows = research_evidence_rows.saturating_add(
-                research_evidence_rows_from_tool(name, &result, user_message),
-            );
+            if let Some(evidence) = research_log.add(name, &result, user_message).cloned() {
+                ledger.record(crate::ledger::Event::Evidence { tool: evidence.tool, source: evidence.source, rows: evidence.rows, total: research_log.rows() });
+            }
             activity.result_detail = bounded_json(&result, 16_000);
             let succeeded = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            ledger.record(crate::ledger::Event::Tool { name: name.to_owned(), ok: succeeded, ms: tool_started.elapsed().as_millis() as u64 });
             if !succeeded {
                 activity.state = "failed".into();
                 activity.result_summary =
-                    "Local action failed; details are in JEV’s response.".into();
+                    "Local action failed; details are in Rhea’s response.".into();
             } else if matches!(name, "desktop_snapshot" | "browser__snapshot") {
                 activity.state = "fresh_snapshot".into();
                 activity.result_summary = summarize_snapshot_result(&result);
@@ -1289,7 +1390,7 @@ fn respond_inner(
             {
                 json!({
                     "supervision_required": true,
-                    "instruction": "This JEV plan is not the final answer. Inspect its result against the user's full goal. If evidence is incomplete, use the available browser or desktop tools to continue; otherwise explain what the evidence confirms and what remains unknown.",
+                    "instruction": "This Rhea plan is not the final answer. Inspect its result against the user's full goal. If evidence is incomplete, use the available browser or desktop tools to continue; otherwise explain what the evidence confirms and what remains unknown.",
                     "jev_result": model_result
                 })
             } else {
@@ -1321,7 +1422,7 @@ fn respond_inner(
     }
 }
 
-/// The user-facing reply for a plan JEV completed, or None when the plan
+/// The user-facing reply for a plan Rhea completed, or None when the plan
 /// stopped and ChatGPT must re-plan from the returned state.
 fn finished_plan_reply(arguments: &Value, result: &Value) -> Option<String> {
     let status = result.pointer("/result/status").and_then(Value::as_str)?;
@@ -1359,7 +1460,7 @@ fn finished_plan_reply(arguments: &Value, result: &Value) -> Option<String> {
 
 /// Return a safe plan payload. Multi-step plans and requests that imply
 /// research, comparisons, thresholds, or a written summary must be reviewed by
-/// ChatGPT after JEV returns; only a one-action mechanical task may use the
+/// ChatGPT after Rhea returns; only a one-action mechanical task may use the
 /// fast local completion path.
 fn enforce_plan_supervision(arguments: &Value, user_message: &str) -> Value {
     let mut guarded = arguments.clone();
@@ -1417,244 +1518,6 @@ fn requires_goal_supervision(request: &str) -> bool {
     ]
     .iter()
     .any(|phrase| text.contains(phrase))
-}
-
-fn requires_research_evidence(request: &str) -> bool {
-    let text = request.to_ascii_lowercase();
-    let has = |words: &[&str]| words.iter().any(|word| text.contains(word));
-    let web = has(&[
-        "online", "website", "web ", "web.", "internet", "google", "http", "www.", ".com", "news", "reddit", "roblox", "youtube",
-        "wikipedia", "price", "weather", "players", "games", "rating", "review", "trending", "rolimons", "stock", "store",
-    ]);
-    let local = has(&["folder", "file", "repo", "project", "directory", "src", "code", "codebase", "function", "cargo", "subagent"]);
-    if local && !web {
-        return false;
-    }
-    let strong = has(&[
-        "research", "search", "look up", "look for", "find games", "find me", "browse", "sources", "across sites", "statistics",
-        "active players", "player count",
-    ]);
-    let weak = has(&[
-        "compare", "summarize", "summary", "current", "latest", "more than", "at least", "over ", "top ", "1k", "1,000",
-    ]);
-    strong || (weak && web)
-}
-
-/// Evidence must come from a successful browser/search/extraction tool and
-/// contain substantive returned data. A plan status, navigation result, or
-/// assistant promise is never research evidence.
-fn research_evidence_rows_from_tool(name: &str, result: &Value, request: &str) -> usize {
-    if result.get("ok").and_then(Value::as_bool) != Some(true) {
-        return 0;
-    }
-    let name = name.to_ascii_lowercase();
-    let web_or_search_tool =
-        (name.starts_with("browser__") || name.starts_with("web_") || name.starts_with("mcp__"))
-            && ["search", "extract", "fetch", "query"]
-                .iter()
-                .any(|kind| name.contains(kind));
-    if !web_or_search_tool {
-        return 0;
-    }
-    let payload = compact_agent_output(result).to_string();
-    let normalized = payload.to_ascii_lowercase();
-    let useful_chars = payload.chars().filter(|ch| ch.is_alphanumeric()).count();
-    if useful_chars < 32
-        || ["no results", "0 results", "no matches", "empty result"]
-            .iter()
-            .any(|text| normalized.contains(text))
-    {
-        return 0;
-    }
-    let request = request.to_ascii_lowercase();
-    let metric_required = [
-        "active player",
-        "player count",
-        "more than",
-        "at least",
-        "1k",
-        "1,000",
-        "over ",
-    ]
-    .iter()
-    .any(|phrase| request.contains(phrase));
-    if metric_required {
-        let Some(threshold) = requested_threshold(&request) else {
-            return 0;
-        };
-        return qualifying_metric_count(&payload, threshold, &request);
-    }
-    1
-}
-
-fn required_research_evidence_rows(request: &str) -> usize {
-    let text = request.to_ascii_lowercase();
-    if text
-        .split(|ch: char| !ch.is_alphanumeric())
-        .any(|word| matches!(word, "games" | "options" | "items" | "sources"))
-    {
-        2
-    } else {
-        1
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResearchCompletion {
-    Accept,
-    Retry,
-    Block,
-}
-
-fn research_completion_gate(
-    research_task: bool,
-    evidence_rows: usize,
-    required_rows: usize,
-    retry_count: u8,
-) -> ResearchCompletion {
-    if !research_task || evidence_rows >= required_rows {
-        return ResearchCompletion::Accept;
-    }
-    if retry_count == 0 {
-        ResearchCompletion::Retry
-    } else {
-        ResearchCompletion::Block
-    }
-}
-
-fn requested_threshold(request: &str) -> Option<f64> {
-    let tokens: Vec<&str> = request.split_whitespace().collect();
-    // Prefer a number attached to the requested comparison. A prompt such as
-    // "find 10 games with more than 1K players" contains two numbers; using
-    // the first one would silently weaken the actual player threshold to 10.
-    let mut comparisons: Vec<(bool, usize, f64)> = Vec::new();
-    for phrase in [
-        "more than",
-        "greater than",
-        "at least",
-        "over",
-        "above",
-        "no less than",
-        "at most",
-        "no more than",
-        "less than",
-        "under",
-        "below",
-    ] {
-        for (position, _) in request.match_indices(phrase) {
-            let suffix = &request[position + phrase.len()..];
-            let suffix_tokens: Vec<&str> = suffix.split_whitespace().collect();
-            if let Some((number_index, value)) = suffix_tokens
-                .iter()
-                .enumerate()
-                .find_map(|(index, token)| parse_threshold_token(token).map(|value| (index, value)))
-            {
-                let metric_context =
-                    suffix_tokens
-                        .iter()
-                        .skip(number_index + 1)
-                        .take(5)
-                        .any(|token| {
-                            let token = token.to_ascii_lowercase();
-                            [
-                                "player", "playing", "active", "count", "user", "download",
-                                "visit", "member",
-                            ]
-                            .iter()
-                            .any(|metric| token.contains(metric))
-                        });
-                comparisons.push((metric_context, position, value));
-            }
-        }
-    }
-    if let Some((_, _, value)) = comparisons
-        .iter()
-        .filter(|(metric, _, _)| *metric)
-        .max_by_key(|(_, position, _)| *position)
-    {
-        return Some(*value);
-    }
-    if comparisons.len() == 1 {
-        return comparisons.first().map(|(_, _, value)| *value);
-    }
-    // If there is no comparison wording, use a sole numeric value. Ambiguous
-    // multi-number requests remain blocked until the model gathers clearer evidence.
-    let numbers: Vec<f64> = tokens
-        .iter()
-        .filter_map(|token| parse_threshold_token(token))
-        .collect();
-    if numbers.len() == 1 {
-        numbers.first().copied()
-    } else {
-        None
-    }
-}
-
-fn parse_threshold_token(token: &str) -> Option<f64> {
-    let candidate =
-        token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.' && ch != ',');
-    parse_compact_number(candidate)
-}
-
-fn parse_compact_number(value: &str) -> Option<f64> {
-    let normalized = value.trim().trim_end_matches('+').replace(',', "");
-    if normalized.is_empty() {
-        return None;
-    }
-    let (digits, scale) = match normalized.chars().last()?.to_ascii_lowercase() {
-        'k' => (&normalized[..normalized.len() - 1], 1_000.0),
-        'm' => (&normalized[..normalized.len() - 1], 1_000_000.0),
-        'b' => (&normalized[..normalized.len() - 1], 1_000_000_000.0),
-        _ => (normalized.as_str(), 1.0),
-    };
-    let number = digits.parse::<f64>().ok()?;
-    Some(number * scale)
-}
-
-fn qualifying_metric_count(payload: &str, threshold: f64, request: &str) -> usize {
-    let words: Vec<&str> = payload.split_whitespace().collect();
-    let lower: Vec<String> = words.iter().map(|word| word.to_ascii_lowercase()).collect();
-    let strict_more = request.contains("more than")
-        || request.contains("greater than")
-        || request.contains("over ")
-        || request.contains('>');
-    let strict_less =
-        request.contains("less than") || request.contains("under ") || request.contains('<');
-    let at_most = request.contains("at most") || request.contains("no more than");
-    let mut qualifying = 0;
-    for (index, token) in words.iter().enumerate() {
-        let candidate =
-            token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.' && ch != ',');
-        let Some(value) = parse_compact_number(candidate) else {
-            continue;
-        };
-        let start = index.saturating_sub(4);
-        let end = (index + 5).min(lower.len());
-        let context = lower[start..end].join(" ");
-        if !["player", "playing", "active", "count"]
-            .iter()
-            .any(|metric| context.contains(metric))
-        {
-            continue;
-        }
-        let meets = if strict_more {
-            value > threshold
-        } else if strict_less {
-            value < threshold
-        } else if at_most {
-            value <= threshold
-        } else {
-            value >= threshold
-        };
-        if meets {
-            qualifying += 1;
-        }
-    }
-    qualifying
-}
-
-fn research_blocker_reply() -> String {
-    "I couldn’t verify enough source results to complete the requested research criteria. I haven’t confirmed that the requested threshold or result count was met.".into()
 }
 
 fn summarize_tool_arguments(name: &str, arguments: &Value) -> String {
@@ -1728,7 +1591,7 @@ fn summarize_snapshot_result(result: &Value) -> String {
 fn summarize_tool_result(name: &str, result: &Value) -> String {
     if let Some(message) = result.get("error").and_then(Value::as_str) {
         let _ = message;
-        return "Local tool failed; details are in JEV’s response.".into();
+        return "Local tool failed; details are in Rhea’s response.".into();
     }
     match name {
         "browser__snapshot" => summarize_snapshot_result(result),
@@ -1774,9 +1637,9 @@ fn summarize_tool_result(name: &str, result: &Value) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
             {
-                "completed" => format!("JEV ran all {steps} step(s) · {total} ms"),
+                "completed" => format!("Rhea ran all {steps} step(s) · {total} ms"),
                 "completed_unverified" => format!(
-                    "JEV ran all {steps} step(s) · send unverified, do not retry · {total} ms"
+                    "Rhea ran all {steps} step(s) · send unverified, do not retry · {total} ms"
                 ),
                 _ => {
                     let failed = result
@@ -1968,7 +1831,7 @@ fn bounded_json(value: &Value, limit: usize) -> String {
     )
 }
 
-/// What the model sees of a tool result. Desktop (JEV) results are trimmed hard: raw accessibility
+/// What the model sees of a tool result. Desktop (Rhea) results are trimmed hard: raw accessibility
 /// trees stay local and every string is cut short. Everything else (Shell file and command output,
 /// Chrome pages, MCP tools, agent reports, skills) is real content the model asked for, so it
 /// passes through whole up to a generous cap instead of being clipped to a few hundred characters.
@@ -1977,7 +1840,7 @@ fn model_output(name: &str, result: &Value) -> Value {
     let passes_whole = name.starts_with("mcp__")
         || name.starts_with("browser__")
         || name.starts_with("agent_")
-        || matches!(name, "use_skill" | "install_skill" | "list_mcps" | "ask_user" | "propose_plan");
+        || matches!(name, "use_skill" | "install_skill" | "laya_decide" | "memory_search" | "memory_remember" | "memory_forget" | "list_mcps" | "ask_user" | "propose_plan");
     if !passes_whole {
         return compact_agent_output(result);
     }
@@ -1993,7 +1856,7 @@ fn model_output(name: &str, result: &Value) -> Value {
     })
 }
 
-fn compact_agent_output(value: &Value) -> Value {
+pub(crate) fn compact_agent_output(value: &Value) -> Value {
     fn compact(value: &Value, remaining: &mut usize, depth: usize) -> Value {
         if *remaining == 0 || depth > 8 {
             return Value::String("[local result trimmed]".into());
@@ -2008,7 +1871,7 @@ fn compact_agent_output(value: &Value) -> Value {
             Value::Object(object) => {
                 let mut safe = serde_json::Map::new();
                 for (key, item) in object.iter().take(64) {
-                    // Raw accessibility trees remain local to JEV and are omitted from API history.
+                    // Raw accessibility trees remain local to Rhea and are omitted from API history.
                     if matches!(
                         key.as_str(),
                         "tree" | "raw_tree" | "pixels" | "image_base64"
@@ -2066,7 +1929,7 @@ fn compact_history(
 ) -> Result<String, String> {
     let mut input = vec![
         json!({"role":"developer","content":system_prompt()}),
-        json!({"role":"developer","content":"Summarize older completed conversation turns for JEV. Preserve user goals, exact names and text still needed, decisions, constraints, safety boundaries, pending work, and verified outcomes. Remove incidental screen content and secrets. Do not perform desktop actions. Return a compact factual memory only."}),
+        json!({"role":"developer","content":"Summarize older completed conversation turns for Rhea. Preserve user goals, exact names and text still needed, decisions, constraints, safety boundaries, pending work, and verified outcomes. Remove incidental screen content and secrets. Do not perform desktop actions. Return a compact factual memory only."}),
     ];
     if !prior_summary.trim().is_empty() {
         input.push(json!({"role":"developer","content":format!("Existing compacted memory:\n{}", prior_summary.trim())}));
@@ -2087,7 +1950,7 @@ fn compact_history(
     let mut request = http.post("https://chatgpt.com/backend-api/codex/responses")
         .bearer_auth(access_token)
         .header("originator", "codex_cli_rs")
-        .header(reqwest::header::USER_AGENT, format!("JARVUS/{}", env!("CARGO_PKG_VERSION")))
+        .header(reqwest::header::USER_AGENT, format!("Rhea/{}", env!("CARGO_PKG_VERSION")))
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .json(&body);
     if let Some(session) = session_id {
@@ -2185,7 +2048,7 @@ fn resume_items(saved: &crate::chat_store::ModelState, history: &[Turn]) -> (Vec
 fn base_input(summary: &str) -> Vec<Value> {
     let mut input = vec![
         json!({"role":"developer","content":system_prompt()}),
-        json!({"role":"developer","content":"ChatGPT plans; JEV tools execute. Use fresh Agent Desktop observations before every state-changing step."}),
+        json!({"role":"developer","content":"ChatGPT plans; Rhea tools execute. Use fresh Agent Desktop observations before every state-changing step."}),
     ];
     if !summary.trim().is_empty() {
         input.push(json!({"role":"developer","content":format!("Earlier conversation summary (the full local transcript is preserved):\n{}", summary.trim())}));
@@ -2339,13 +2202,26 @@ pub fn compact_items(
     Ok((summary, remaining, summarized_turns))
 }
 
+/// Rough token counts for the pieces `/compact` reports (about four characters per token).
+pub fn estimate_text_tokens(text: &str) -> u64 {
+    estimate_tokens(text)
+}
+
+pub fn estimate_turn_tokens(turns: &[Turn]) -> u64 {
+    estimate_turns(turns)
+}
+
+pub fn estimate_state_tokens(state: &crate::chat_store::ModelState) -> u64 {
+    estimate_items(&state.items)
+}
+
 fn estimate_tokens(text: &str) -> u64 {
     (text.chars().count() as u64).saturating_add(3) / 4
 }
 
 pub fn estimate_context_tokens(summary: &str, history: &[Turn], user_message: &str) -> u64 {
     estimate_tokens(system_prompt())
-        .saturating_add(estimate_tokens("ChatGPT plans; JEV tools execute. Use fresh Agent Desktop observations before every state-changing step."))
+        .saturating_add(estimate_tokens("ChatGPT plans; Rhea tools execute. Use fresh Agent Desktop observations before every state-changing step."))
         .saturating_add(estimate_tokens(summary))
         .saturating_add(estimate_turns(history))
         .saturating_add(estimate_tokens(user_message))
@@ -2814,6 +2690,15 @@ fn is_connection_inventory_question(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_same_result_twice_is_one_piece_of_research_evidence() {
+        let page = json!({"ok": true, "text": "Game A has 5,000 players and Game B has 7,000 players this week"});
+        let same = json!({"ok": true, "text": "Game A has 5,000 players and Game B has 7,000 players this week"});
+        let other = json!({"ok": true, "text": "Game C has 9,000 players and Game D has 12,000 players this week"});
+        assert_eq!(evidence_fingerprint(&page), evidence_fingerprint(&same));
+        assert_ne!(evidence_fingerprint(&page), evidence_fingerprint(&other));
+    }
+
     use super::*;
 
     #[test]
@@ -2918,7 +2803,7 @@ mod tests {
             crate::jev::run_plan(&empty)
                 .unwrap_err()
                 .contains("1 to 25 steps"),
-            "JEV must reject a zero-step plan before touching the desktop"
+            "Rhea must reject a zero-step plan before touching the desktop"
         );
         let multi = json!({"steps":[{"do":"open_app"},{"do":"click"}],"done_message":"Done."});
         let multi_done = json!({"ok":true,"result":{"status":"completed","message_sent":false,"completed_steps":[{"step":1},{"step":2}],"total_ms":1000}});
@@ -3008,7 +2893,7 @@ mod tests {
             0
         );
         assert!(
-            research_blocker_reply()
+            research_blocker_reply(&EvidenceLog::default(), 2)
                 .contains("haven’t confirmed that the requested threshold or result count was met")
         );
         assert_eq!(
@@ -3074,8 +2959,8 @@ mod tests {
     #[test]
     #[ignore]
     fn live_plan_navigation_only() {
-        // JARVUS_PLAN='<steps json>' cargo test --bin jarvus live_plan -- --ignored --nocapture
-        let steps: Value = serde_json::from_str(&std::env::var("JARVUS_PLAN").unwrap()).unwrap();
+        // RHEA_PLAN='<steps json>' cargo test --bin rhea live_plan -- --ignored --nocapture
+        let steps: Value = serde_json::from_str(&std::env::var("RHEA_PLAN").unwrap()).unwrap();
         assert!(
             steps.to_string().contains("\"send\"") == false
                 && steps.to_string().contains("\"message\"") == false
@@ -3162,6 +3047,7 @@ mod tests {
                 priority: Some(1),
                 supported_reasoning_levels: vec!["low".into(), "high".into()],
                 context_window: None,
+                max_context_window: None,
             },
             Model {
                 slug: "gpt-nano".into(),
@@ -3169,6 +3055,7 @@ mod tests {
                 priority: Some(3),
                 supported_reasoning_levels: vec!["medium".into(), "minimal".into()],
                 context_window: None,
+                max_context_window: None,
             },
         ];
         assert_eq!(
@@ -3188,6 +3075,7 @@ mod tests {
             priority: None,
             supported_reasoning_levels: vec!["low".into()],
             context_window: None,
+                max_context_window: None,
         }];
         let no_effort_metadata = vec![Model {
             slug: "gpt-mini".into(),
@@ -3195,6 +3083,7 @@ mod tests {
             priority: None,
             supported_reasoning_levels: vec![],
             context_window: None,
+                max_context_window: None,
         }];
         assert!(title_model(&no_small_model).is_none());
         assert!(title_model(&no_effort_metadata).is_none());
@@ -3297,12 +3186,12 @@ mod tests {
     fn shell_and_agent_results_reach_the_model_whole_but_desktop_results_stay_trimmed() {
         let long = "z".repeat(5_000);
         let shell = json!({"ok":true,"result":{"content":long.clone()}});
-        assert_eq!(model_output("mcp__jarvus_shell__read_file", &shell), shell);
+        assert_eq!(model_output("mcp__rhea_shell__read_file", &shell), shell);
         assert_eq!(model_output("agent_read", &json!({"result":long.clone()}))["result"].as_str().unwrap().len(), 5_000);
         let desktop = model_output("desktop_find", &json!({"text":long.clone()}));
         assert!(desktop["text"].as_str().unwrap().chars().count() <= 241);
         let huge = json!({"stdout":"q".repeat(100_000)});
-        let capped = model_output("mcp__jarvus_shell__run_command", &huge);
+        let capped = model_output("mcp__rhea_shell__run_command", &huge);
         assert_eq!(capped["truncated"], true);
         assert_eq!(capped["partial"].as_str().unwrap().chars().count(), 60_000);
     }
@@ -3314,7 +3203,7 @@ mod tests {
             content: "Done.".into(),
             tool_activity: vec![ToolActivity {
                 id: "1".into(),
-                name: "mcp__jarvus_shell__run_command".into(),
+                name: "mcp__rhea_shell__run_command".into(),
                 arguments_detail: "{\"command\":\"dir\"}".into(),
                 result_detail: "{\"stdout\": \"a.txt   b.txt\"}".into(),
                 state: "complete".into(),
@@ -3403,7 +3292,7 @@ mod tests {
 
     /// Live check (needs a signed-in session): a second run must continue from the first run's tool
     /// calls and results, replayed to the Codex backend with `store:false`. Run with:
-    /// cargo test --bin jarvus live_second_run_remembers_the_first_runs_tool_calls -- --ignored --nocapture
+    /// cargo test --bin rhea live_second_run_remembers_the_first_runs_tool_calls -- --ignored --nocapture
     #[test]
     #[ignore]
     fn live_second_run_remembers_the_first_runs_tool_calls() {
@@ -3417,7 +3306,7 @@ mod tests {
             let seen = Arc::clone(&calls);
             let sink = Arc::clone(&saved);
             let options = RunOptions {
-                session_id: Some("jarvus-live-probe".into()),
+                session_id: Some("rhea-live-probe".into()),
                 state,
                 on_state: Some(Box::new(move |state| *sink.lock().unwrap() = Some(state))),
                 ..Default::default()
@@ -3460,6 +3349,60 @@ mod tests {
         assert!(second.contains("ALPHA-4471"), "the previous tool result must be in context: {second}");
         let after = saved.lock().unwrap().clone().unwrap();
         assert_eq!((after.turns, after.turn_starts.len()), (4, 2));
+    }
+
+    /// Live check (needs a signed-in session): prints every model's size-related catalog fields.
+    /// cargo test --bin rhea live_model_catalog_sizes -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_model_catalog_sizes() {
+        let tokens = crate::auth::token().expect("sign in first");
+        let raw = reqwest::blocking::Client::new()
+            .get(format!("https://chatgpt.com/backend-api/codex/models?client_version={CODEX_CLIENT_VERSION}"))
+            .bearer_auth(&tokens.access_token)
+            .header("originator", "codex_cli_rs")
+            .header("ChatGPT-Account-ID", tokens.account_id.clone().unwrap_or_default())
+            .send()
+            .unwrap()
+            .json::<Value>()
+            .unwrap();
+        for model in raw["models"].as_array().unwrap() {
+            let numbers: Vec<String> = model.as_object().unwrap().iter().filter(|(_, v)| v.is_number()).map(|(k, v)| format!("{k}={v}")).collect();
+            println!("{} [{}] {}", model["slug"], model["visibility"], numbers.join(" "));
+        }
+        let parsed = models(&tokens.access_token, tokens.account_id.as_deref()).unwrap();
+        for model in parsed {
+            println!("parsed {} -> {:?}", model.slug, model.context_window);
+        }
+    }
+
+    #[test]
+    fn a_model_uses_the_accounts_maximum_then_the_catalog_size_then_the_published_one() {
+        let model = |context: Option<u64>, max: Option<u64>| Model {
+            slug: "gpt-6-astra".into(),
+            display_name: "x".into(),
+            priority: None,
+            supported_reasoning_levels: Vec::new(),
+            context_window: context,
+            max_context_window: max,
+        };
+        assert_eq!(model(Some(272_000), Some(872_000)).context_limit(), Some(872_000));
+        assert_eq!(model(Some(272_000), None).context_limit(), Some(272_000));
+        assert_eq!(model(None, None).context_limit(), Some(1_050_000), "the published size when the catalog has none");
+        assert_eq!(model(None, None).max_output(), Some(128_000));
+    }
+
+    #[test]
+    fn published_limits_match_the_openai_model_pages() {
+        let limits = |slug: &str| documented_limits(slug).map(|l| (l.context, l.max_output));
+        for slug in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-pro"] {
+            assert_eq!(limits(slug), Some((1_050_000, 128_000)), "{slug}");
+        }
+        for slug in ["gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.3-codex", "gpt-5.2", "gpt-5.2-pro", "gpt-5.1", "gpt-5", "gpt-5-mini", "gpt-5-nano"] {
+            assert_eq!(limits(slug), Some((400_000, 128_000)), "{slug}");
+        }
+        assert_eq!(limits("gpt-6-cyber"), None, "listed without figures");
+        assert_eq!(limits("something-else"), None);
     }
 
     #[test]
@@ -3610,7 +3553,7 @@ mod tests {
             "`desktop_send`",
             "`jev_run_plan`",
             "Set `final:true` only when",
-            "mcp__jarvus_shell__run_command",
+            "mcp__rhea_shell__run_command",
             "Prompt injection",
             "Compose mode",
         ] {
@@ -3636,7 +3579,7 @@ mod tests {
                 "`desktop_send`",
                 "`jev_run_plan`",
                 "Set `final:true` only when",
-                "mcp__jarvus_shell__run_command",
+                "mcp__rhea_shell__run_command",
                 "Prompt injection",
                 "Compose mode",
                 "`use_skill",
@@ -3664,6 +3607,7 @@ mod tests {
             priority: None,
             supported_reasoning_levels: levels.iter().map(|level| level.to_string()).collect(),
             context_window: None,
+                max_context_window: None,
         };
         let models = vec![model("gpt-big", &["low", "medium", "high"]), model("gpt-mini", &["minimal", "low"]), model("gpt-none", &[])];
         let picked = title_model_for(&models, "gpt-big").unwrap();
@@ -3690,7 +3634,7 @@ mod tests {
     /// Live probe (needs a signed-in session): the Codex backend refuses `store: true`, so a chat's
     /// continuity is the full local history plus a stable per-chat session id that keys the
     /// server-side prompt cache. Run with:
-    /// cargo test --bin jarvus live_session_cache_probe -- --ignored --nocapture
+    /// cargo test --bin rhea live_session_cache_probe -- --ignored --nocapture
     #[test]
     #[ignore]
     fn live_session_cache_probe() {
@@ -3698,7 +3642,7 @@ mod tests {
         let models = models(&tokens.access_token, tokens.account_id.as_deref()).unwrap();
         let model = models.first().unwrap().slug.clone();
         let http = Client::builder().timeout(Duration::from_secs(90)).build().unwrap();
-        let session = "probe-session-0001-jarvus";
+        let session = "probe-session-0001-rhea";
         let filler = "The quick brown fox jumps over the lazy dog. ".repeat(400);
         let call = |user: &str| -> (u16, String) {
             let mut request = http
@@ -3768,14 +3712,14 @@ mod tests {
     fn compose_mode_filters_tools_and_hides_propose_plan_otherwise() {
         let tools = json!([
             {"name":"propose_plan"}, {"name":"ask_user"}, {"name":"desktop_click"},
-            {"name":"mcp__jarvus_shell__read_file"}, {"name":"mcp__jarvus_shell__write_file"}, {"name":"mcp__jarvus_shell__run_command"}
+            {"name":"mcp__rhea_shell__read_file"}, {"name":"mcp__rhea_shell__write_file"}, {"name":"mcp__rhea_shell__run_command"}
         ]);
         let names = |value: Value| value.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
         let composing = names(request_tools(&tools, true, &[]));
         assert!(composing.contains(&"propose_plan".to_owned()));
-        assert!(composing.contains(&"mcp__jarvus_shell__read_file".to_owned()));
+        assert!(composing.contains(&"mcp__rhea_shell__read_file".to_owned()));
         assert!(!composing.contains(&"desktop_click".to_owned()));
-        assert!(!composing.contains(&"mcp__jarvus_shell__write_file".to_owned()));
+        assert!(!composing.contains(&"mcp__rhea_shell__write_file".to_owned()));
         let normal = names(request_tools(&tools, false, &[]));
         assert!(!normal.contains(&"propose_plan".to_owned()));
         assert!(normal.contains(&"desktop_click".to_owned()));
