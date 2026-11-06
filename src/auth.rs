@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -59,8 +60,28 @@ struct TokenReply {
     expires_in: Option<Value>,
 }
 
+/// The session lives in memory after the first read: the credential store (the macOS Keychain
+/// especially) asks the user for permission on every read, and every chat run, title, subagent
+/// and model refresh needs the token.
+static SESSION: Mutex<Option<Tokens>> = Mutex::new(None);
+/// One refresh at a time; a rotated refresh token must not be spent twice.
+static REFRESH: Mutex<()> = Mutex::new(());
+
+fn remember(tokens: Option<&Tokens>) {
+    *SESSION.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = tokens.cloned();
+}
+
 pub fn token() -> Result<Tokens, String> {
-    let mut tokens = load()?;
+    let _one_at_a_time = REFRESH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cached = SESSION.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    let mut tokens = match cached {
+        Some(tokens) => tokens,
+        None => {
+            let loaded = load()?;
+            remember(Some(&loaded));
+            loaded
+        }
+    };
     if tokens.expires_at > now_secs().saturating_add(60) {
         return Ok(tokens);
     }
@@ -101,6 +122,7 @@ pub fn token() -> Result<Tokens, String> {
     tokens.expires_at =
         now_secs().saturating_add(parse_seconds(update.expires_in.as_ref()).unwrap_or(3600));
     save(&tokens)?;
+    remember(Some(&tokens));
     Ok(tokens)
 }
 
@@ -228,6 +250,12 @@ pub fn sign_in(
 }
 
 pub fn sign_out() -> Result<(), String> {
+    remember(None);
+    let single = keyring::Entry::new(SERVICE, SINGLE_ACCOUNT).map_err(|e| e.to_string())?;
+    match single.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(e) => return Err(format!("Could not clear the saved ChatGPT session: {e}")),
+    }
     let old = read_manifest().ok();
     if let Some((generation, count)) = old {
         delete_chunks(&generation, count)?;
@@ -291,7 +319,52 @@ pub fn open_verification_page() -> Result<(), String> {
     }
 }
 
+/// Windows Credential Manager caps one credential at about 2.5 KB, so there the session is split
+/// into pieces (see `save_chunked`). Everywhere else it is a single credential, one read.
+const SINGLE_ACCOUNT: &str = "chatgpt-codex-device-v2";
+
+#[cfg(windows)]
 fn load() -> Result<Tokens, String> {
+    load_chunked()
+}
+
+#[cfg(windows)]
+fn save(tokens: &Tokens) -> Result<(), String> {
+    save_chunked(tokens)
+}
+
+#[cfg(not(windows))]
+fn load() -> Result<Tokens, String> {
+    let entry = keyring::Entry::new(SERVICE, SINGLE_ACCOUNT).map_err(|e| e.to_string())?;
+    match entry.get_password() {
+        Ok(raw) => return serde_json::from_str(&raw).map_err(|e| format!("Saved ChatGPT session is unreadable: {e}")),
+        Err(keyring::Error::NoEntry) => {}
+        Err(e) => return Err(format!("Could not read the saved ChatGPT session from {CREDENTIAL_STORE}: {e}")),
+    }
+    // An earlier build stored the session in many small credentials (a prompt for each one);
+    // move it into the single credential once and remove the pieces.
+    let tokens = load_chunked()?;
+    if save(&tokens).is_ok() {
+        if let Ok((generation, count)) = read_manifest() {
+            let _ = delete_chunks(&generation, count);
+        }
+        if let Ok(manifest) = keyring::Entry::new(SERVICE, MANIFEST_ACCOUNT) {
+            let _ = manifest.delete_credential();
+        }
+    }
+    Ok(tokens)
+}
+
+#[cfg(not(windows))]
+fn save(tokens: &Tokens) -> Result<(), String> {
+    let raw = serde_json::to_string(tokens).map_err(|e| e.to_string())?;
+    let entry = keyring::Entry::new(SERVICE, SINGLE_ACCOUNT).map_err(|e| e.to_string())?;
+    entry
+        .set_password(&raw)
+        .map_err(|e| format!("Could not save ChatGPT credentials to {CREDENTIAL_STORE}: {e}"))
+}
+
+fn load_chunked() -> Result<Tokens, String> {
     let (generation, count) = match read_manifest() {
         Ok(value) => value,
         Err(_) => {
@@ -316,7 +389,8 @@ fn load() -> Result<Tokens, String> {
     serde_json::from_str(&raw).map_err(|e| format!("Saved ChatGPT session is unreadable: {e}"))
 }
 
-fn save(tokens: &Tokens) -> Result<(), String> {
+#[cfg(windows)]
+fn save_chunked(tokens: &Tokens) -> Result<(), String> {
     let raw = serde_json::to_string(tokens).map_err(|e| e.to_string())?;
     let old = read_manifest().ok();
     let generation = format!(

@@ -1765,6 +1765,7 @@ fn save_credentials(
     env: &BTreeMap<String, String>,
     headers: &BTreeMap<String, String>,
 ) -> Result<(), String> {
+    credential_cache().lock().unwrap_or_else(|p| p.into_inner()).remove(id);
     let entry =
         keyring::Entry::new(KEYRING_SERVICE, &keyring_account(id)).map_err(|e| e.to_string())?;
     if env.is_empty() && headers.is_empty() {
@@ -1795,7 +1796,25 @@ fn delete_keyring_credential(entry: &keyring::Entry) -> Result<(), keyring::Erro
         Err(error) => Err(error),
     }
 }
-fn load_credentials(
+type Credentials = (BTreeMap<String, String>, BTreeMap<String, String>);
+
+/// Credentials already read this session. The OS credential store asks the user's permission on
+/// every read (the macOS Keychain especially), and a server that is down is retried regularly.
+fn credential_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Credentials>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Credentials>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn load_credentials(id: &str) -> Result<Credentials, String> {
+    if let Some(found) = credential_cache().lock().unwrap_or_else(|p| p.into_inner()).get(id) {
+        return Ok(found.clone());
+    }
+    let loaded = load_credentials_uncached(id)?;
+    credential_cache().lock().unwrap_or_else(|p| p.into_inner()).insert(id.to_owned(), loaded.clone());
+    Ok(loaded)
+}
+
+fn load_credentials_uncached(
     id: &str,
 ) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>), String> {
     let entry =
