@@ -4995,8 +4995,20 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// The Chrome extension folder: bundled next to the app (`JARVUS.app/Contents/Resources` on a Mac,
+/// beside the executable elsewhere), falling back to the source checkout it was built from.
 fn extension_package_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chrome-extension")
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = env::current_exe().ok().and_then(|exe| exe.parent().map(PathBuf::from)) {
+        candidates.push(dir.join("chrome-extension"));
+        candidates.push(dir.join("../Resources/chrome-extension"));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chrome-extension"));
+    candidates
+        .iter()
+        .find(|path| path.join("manifest.json").is_file())
+        .cloned()
+        .unwrap_or_else(|| candidates.last().cloned().unwrap_or_default())
 }
 
 fn new_conversation() -> Conversation {
@@ -5476,7 +5488,7 @@ fn app_data_root() -> Option<PathBuf> {
 }
 
 fn captures_directory() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("captures")
+    chat_store::captures_dir()
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {

@@ -286,11 +286,9 @@ pub fn snapshot_target_options(
     )?;
 
     let visualization = if include_visualization {
-        let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("captures")
-            .join("agent-desktop");
+        let folder = crate::chat_store::captures_dir().join("agent-desktop");
         fs::create_dir_all(&folder)
-            .map_err(|error| format!("Could not create local visualization folder: {error}"))?;
+            .map_err(|error| format!("Could not create local visualization folder {}: {error}", folder.display()))?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
@@ -2813,11 +2811,9 @@ fn validate_ref_snapshot(snapshot_id: &str, reference: &str) -> Result<(), Strin
 }
 
 pub fn screenshot(app: Option<&str>, window_id: Option<&str>) -> Result<Value, String> {
-    let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("captures")
-        .join("agent-desktop");
+    let folder = crate::chat_store::captures_dir().join("agent-desktop");
     fs::create_dir_all(&folder)
-        .map_err(|error| format!("Could not create local screenshot folder: {error}"))?;
+        .map_err(|error| format!("Could not create local screenshot folder {}: {error}", folder.display()))?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?

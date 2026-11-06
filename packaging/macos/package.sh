@@ -37,6 +37,7 @@ sed "s/@VERSION@/${version}/g" packaging/macos/Info.plist > "$app/Contents/Info.
 cp packaging/macos/THIRD_PARTY.txt "$app/Contents/Resources/THIRD_PARTY.txt"
 cp README.md "$app/Contents/Resources/README.md"
 cp assets/jarvus-mark.png "$app/Contents/Resources/jarvus-mark.png"
+cp -R chrome-extension "$app/Contents/Resources/chrome-extension"
 
 echo "==> icon"
 iconset="$dist/jarvus.iconset"

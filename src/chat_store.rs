@@ -30,6 +30,13 @@ pub fn app_data_root() -> Option<PathBuf> {
         .map(|home| home.join(".jarvus"))
 }
 
+/// Where screenshots and snapshot pictures are kept: `~/.jarvus/captures`. (Never a path baked in at
+/// build time: that is the build machine's folder, which does not exist or is not writable on the
+/// machine the app runs on.)
+pub fn captures_dir() -> PathBuf {
+    app_data_root().unwrap_or_else(env::temp_dir).join("captures")
+}
+
 pub fn chats_root() -> Option<PathBuf> {
     app_data_root().map(|root| root.join("chats"))
 }
