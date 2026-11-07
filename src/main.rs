@@ -16,6 +16,7 @@ mod ledger;
 #[cfg(target_os = "macos")]
 mod macos;
 mod mcp;
+mod opencode;
 mod research;
 #[cfg(test)]
 mod replay;

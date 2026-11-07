@@ -16,10 +16,32 @@ use crate::research::{evidence_fingerprint, requested_threshold, research_eviden
 // ChatGPT subscription access uses the Codex account catalog and response route.
 const CODEX_CLIENT_VERSION: &str = "0.166.0";
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Which backend a model is asked through. Every request still carries Rhea's own local
+/// transcript (see `resume_items`/`base_input`), never server-held state, so switching the
+/// selected model from one provider to another mid-chat carries the same history either way -
+/// there is nothing provider-specific to lose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Provider {
+    #[default]
+    ChatGpt,
+    OpenCode,
+}
+
+impl Provider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::ChatGpt => "ChatGPT",
+            Provider::OpenCode => "OpenCode",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Model {
     pub slug: String,
     pub display_name: String,
+    #[serde(default)]
+    pub provider: Provider,
     /// Catalog ordering hint from the Codex model API, not a price.
     #[serde(default)]
     pub priority: Option<i64>,
@@ -35,14 +57,14 @@ pub struct Model {
 
 impl Model {
     /// The model's full context: the account's maximum, else the catalog's size, else what the
-    /// OpenAI model pages publish.
+    /// OpenAI model pages publish (ChatGPT models only; OpenCode's catalog reports its own).
     pub fn context_limit(&self) -> Option<u64> {
-        self.max_context_window.or(self.context_window).or_else(|| documented_limits(&self.slug).map(|limits| limits.context))
+        self.max_context_window.or(self.context_window).or_else(|| (self.provider == Provider::ChatGpt).then(|| documented_limits(&self.slug)).flatten().map(|limits| limits.context))
     }
 
-    /// The most the model can write in one reply, from the OpenAI model pages.
+    /// The most the model can write in one reply, from the OpenAI model pages (ChatGPT only).
     pub fn max_output(&self) -> Option<u64> {
-        documented_limits(&self.slug).map(|limits| limits.max_output)
+        (self.provider == Provider::ChatGpt).then(|| documented_limits(&self.slug)).flatten().map(|limits| limits.max_output)
     }
 }
 
@@ -114,6 +136,7 @@ pub fn models(access_token: &str, account_id: Option<&str>) -> Result<Vec<Model>
             Some(Model {
                 slug: m.get("slug")?.as_str()?.to_owned(),
                 display_name: m.get("display_name")?.as_str()?.to_owned(),
+                provider: Provider::ChatGpt,
                 priority: m.get("priority").and_then(Value::as_i64),
                 supported_reasoning_levels: m
                     .get("supported_reasoning_levels")
@@ -3051,6 +3074,7 @@ mod tests {
             Model {
                 slug: "gpt-mini".into(),
                 display_name: "Mini".into(),
+                provider: Provider::ChatGpt,
                 priority: Some(1),
                 supported_reasoning_levels: vec!["low".into(), "high".into()],
                 context_window: None,
@@ -3059,6 +3083,7 @@ mod tests {
             Model {
                 slug: "gpt-nano".into(),
                 display_name: "Nano".into(),
+                provider: Provider::ChatGpt,
                 priority: Some(3),
                 supported_reasoning_levels: vec!["medium".into(), "minimal".into()],
                 context_window: None,
@@ -3079,6 +3104,7 @@ mod tests {
         let no_small_model = vec![Model {
             slug: "gpt-main".into(),
             display_name: "Main".into(),
+            provider: Provider::ChatGpt,
             priority: None,
             supported_reasoning_levels: vec!["low".into()],
             context_window: None,
@@ -3087,6 +3113,7 @@ mod tests {
         let no_effort_metadata = vec![Model {
             slug: "gpt-mini".into(),
             display_name: "Mini".into(),
+            provider: Provider::ChatGpt,
             priority: None,
             supported_reasoning_levels: vec![],
             context_window: None,
@@ -3388,6 +3415,7 @@ mod tests {
         let model = |context: Option<u64>, max: Option<u64>| Model {
             slug: "gpt-6-astra".into(),
             display_name: "x".into(),
+            provider: Provider::ChatGpt,
             priority: None,
             supported_reasoning_levels: Vec::new(),
             context_window: context,
@@ -3611,6 +3639,7 @@ mod tests {
         let model = |slug: &str, levels: &[&str]| Model {
             slug: slug.into(),
             display_name: slug.into(),
+            provider: Provider::ChatGpt,
             priority: None,
             supported_reasoning_levels: levels.iter().map(|level| level.to_string()).collect(),
             context_window: None,
