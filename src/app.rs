@@ -2003,6 +2003,7 @@ impl RheaApp {
                 .show(ui, |ui| {
                     let mut delete_index = None;
                     let mut archive_index = None;
+                    let mut activate_index = None;
                     let mut shown_rows = 0usize;
                     for index in 0..self.conversations.len() {
                         // A new chat has no card until its first message is sent.
@@ -2237,7 +2238,10 @@ impl RheaApp {
                             self.pending_chat_delete = None;
                         }
                         if response.clicked() && !action_clicked && !self.streaming {
-                            self.activate_conversation(index);
+                            // Deferred to after the loop: activating a chat can drop blank rows
+                            // via drop_blank_chats, shrinking self.conversations mid-iteration and
+                            // panicking on a now out-of-range `index` for the rows still to come.
+                            activate_index = Some(index);
                         }
                         ui.add_space(6.0);
                     }
@@ -2246,6 +2250,8 @@ impl RheaApp {
                         self.delete_chat(index);
                     } else if let Some(index) = archive_index {
                         self.archive_chat(index);
+                    } else if let Some(index) = activate_index {
+                        self.activate_conversation(index);
                     }
                 });
         });
