@@ -114,13 +114,23 @@ fn replay(replies: Vec<String>, message: &str, tool: impl FnMut(&str, &Value) ->
     replay_with(replies, message, false, tool)
 }
 
-fn replay_with(replies: Vec<String>, message: &str, fast: bool, mut tool: impl FnMut(&str, &Value) -> Result<Value, String>) -> Replay {
+fn replay_with(replies: Vec<String>, message: &str, fast: bool, tool: impl FnMut(&str, &Value) -> Result<Value, String>) -> Replay {
+    replay_as(replies, message, RunOptions { fast, ..Default::default() }, tool)
+}
+
+/// A round scripted as OpenAI-compatible chat-completions SSE (not the Responses API's shape),
+/// against the OpenCode provider path.
+fn replay_opencode(replies: Vec<String>, message: &str, tool: impl FnMut(&str, &Value) -> Result<Value, String>) -> Replay {
+    replay_as(replies, message, RunOptions { provider: crate::chat::Provider::OpenCode, ..Default::default() }, tool)
+}
+
+fn replay_as(replies: Vec<String>, message: &str, base_options: RunOptions, mut tool: impl FnMut(&str, &Value) -> Result<Value, String>) -> Replay {
     let (url, bodies) = serve(replies);
     let dir = std::env::temp_dir().join(format!("rhea-replay-{}-{:?}", std::process::id(), std::thread::current().id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path: PathBuf = dir.join("ledger.jsonl");
-    let options = RunOptions { endpoint: Some(url), ledger: Some(Ledger::at(Some(path.clone()), "main")), fast, ..Default::default() };
+    let options = RunOptions { endpoint: Some(url), ledger: Some(Ledger::at(Some(path.clone()), "main")), ..base_options };
     let shown = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&shown);
     let ran = Arc::new(Mutex::new(Vec::new()));
@@ -321,4 +331,75 @@ fn a_tool_the_run_may_not_use_is_refused_without_running_it() {
     );
     assert_eq!(answer.as_deref(), Ok("ok"));
     assert_eq!(*ran.lock().unwrap(), 0, "a hidden tool must never reach the executor");
+}
+
+// ---- OpenCode: the other side of the provider switch, scripted as Chat Completions SSE --------
+
+fn oc_chunk(delta: Value) -> Value {
+    json!({"choices": [{"index": 0, "delta": delta, "finish_reason": Value::Null}]})
+}
+
+/// A plain-text OpenCode reply, done over a couple of chunks like a real stream would be.
+fn oc_says(text: &str) -> String {
+    let (first, rest) = text.split_at(text.len() / 2);
+    sse(&[
+        oc_chunk(json!({"content": first})),
+        oc_chunk(json!({"content": rest})),
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 40, "completion_tokens": 8}}),
+    ]) + "data: [DONE]\n\n"
+}
+
+/// An OpenCode reply that calls one tool, arguments split across chunks like real streams do.
+fn oc_calls(call_id: &str, name: &str, arguments: &str) -> String {
+    let (first, rest) = arguments.split_at(arguments.len() / 2);
+    sse(&[
+        oc_chunk(json!({"tool_calls": [{"index": 0, "id": call_id, "type": "function", "function": {"name": name, "arguments": ""}}]})),
+        oc_chunk(json!({"tool_calls": [{"index": 0, "function": {"arguments": first}}]})),
+        oc_chunk(json!({"tool_calls": [{"index": 0, "function": {"arguments": rest}}]})),
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+    ]) + "data: [DONE]\n\n"
+}
+
+#[test]
+fn opencode_answers_plain_text_translated_the_same_as_chatgpt() {
+    let run = replay_opencode(vec![oc_says("hi there")], "hello", |_, _| unreachable!("no tools expected"));
+    assert_eq!(run.answer.as_deref(), Ok("hi there"));
+    assert_eq!(run.requests.len(), 1);
+    assert_eq!(run.requests[0]["model"], json!("test-model"));
+    assert!(run.requests[0]["messages"].as_array().unwrap().iter().any(|m| m["content"] == json!("hello")), "{}", run.requests[0]);
+    assert!(ends_with(&run, "completed"));
+}
+
+#[test]
+fn opencode_tool_calls_round_trip_through_the_same_dispatch_as_chatgpt() {
+    let run = replay_opencode(
+        vec![oc_calls("call_1", "run_command", r#"{"command":"echo hi"}"#), oc_says("done")],
+        "run it",
+        |name, arguments| {
+            assert_eq!(name, "run_command");
+            assert_eq!(arguments, &json!({"command": "echo hi"}));
+            Ok(json!({"ok": true, "output": "hi"}))
+        },
+    );
+    assert_eq!(run.answer.as_deref(), Ok("done"));
+    assert_eq!(run.ran, ["run_command"]);
+    // The tool result Rhea fed back is translated into a Chat Completions "tool" message.
+    let second_request = &run.requests[1]["messages"];
+    let tool_message = second_request.as_array().unwrap().iter().find(|m| m["role"] == "tool").expect("a tool-result message");
+    assert_eq!(tool_message["tool_call_id"], json!("call_1"));
+}
+
+#[test]
+fn opencode_fragments_split_mid_stream_still_produce_complete_arguments() {
+    // oc_calls() already splits the JSON arguments string across two chunks; a correctly
+    // reassembled call is what proves the by-index accumulation in chat_round works.
+    let run = replay_opencode(
+        vec![oc_calls("call_9", "run_command", r#"{"command":"ls -la /tmp"}"#), oc_says("ok")],
+        "list files",
+        |_, arguments| {
+            assert_eq!(arguments, &json!({"command": "ls -la /tmp"}));
+            Ok(json!({"ok": true}))
+        },
+    );
+    assert_eq!(run.answer.as_deref(), Ok("ok"));
 }

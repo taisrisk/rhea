@@ -39,6 +39,9 @@ pub struct ToolContext {
     pub context_window: u64,
     /// Fast mode (priority processing) for the runs this context starts.
     pub fast: bool,
+    /// Which backend `model` is asked through. A spawned subagent inherits the main chat's
+    /// provider rather than picking its own, even when it uses a different model slug.
+    pub provider: crate::chat::Provider,
     /// Compose mode was on when this run started; spawned agents inherit read-only limits.
     pub compose: bool,
     /// Model for new subagents; empty = the same model as the caller.
@@ -323,7 +326,10 @@ fn agent_runner(ctx: &ToolContext) -> Runner {
     let base = ctx.clone();
     Arc::new(move |request: &team::RunRequest, update: &dyn Fn(Update)| {
         jev::set_run_stop_flag(request.stop.clone());
-        let tokens = auth::token()?;
+        let (access_token, account_id) = match base.provider {
+            chat::Provider::ChatGpt => auth::token().map(|tokens| (tokens.access_token, tokens.account_id))?,
+            chat::Provider::OpenCode => (crate::opencode::load_api_key().ok_or("OpenCode is not connected. Add an API key in Settings > Connections.")?, None),
+        };
         let mut agent_ctx = base.clone();
         agent_ctx.agent_id = request.agent_id.clone();
         agent_ctx.agent_name = request.name.clone();
@@ -362,10 +368,11 @@ fn agent_runner(ctx: &ToolContext) -> Runner {
             ledger: Some(crate::ledger::Ledger::for_chat(&base.chat_id, &request.agent_id)),
             endpoint: None,
             fast: base.fast,
+            provider: base.provider,
         };
         let outcome = chat::respond_with_options(
-            &tokens.access_token,
-            tokens.account_id.as_deref(),
+            &access_token,
+            account_id.as_deref(),
             &request.model,
             &base.effort,
             base.context_window,
@@ -512,6 +519,7 @@ mod tests {
             effort: "low".into(),
             context_window: 100_000,
             fast: false,
+            provider: chat::Provider::ChatGpt,
             compose: false,
             subagent_model: String::new(),
             compact_percent: 80,

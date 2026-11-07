@@ -855,6 +855,7 @@ impl RheaApp {
             })
             .unwrap_or_default();
         let model = self.selected_model.clone();
+        let provider = self.model_list.iter().find(|m| m.slug == model).map(|m| m.provider).unwrap_or_default();
         let reasoning_effort = self.reasoning_effort.clone();
         let context_window = self.context_window;
         let (extra_tools, _) = self.dynamic_tool_snapshot();
@@ -916,6 +917,7 @@ impl RheaApp {
             effort: reasoning_effort.clone(),
             context_window,
             fast: fast_mode,
+            provider,
             compose,
             subagent_model: self.subagent_model.clone(),
             compact_percent: self.compact_percent,
@@ -974,6 +976,7 @@ impl RheaApp {
                 ledger: Some(ledger::Ledger::for_chat(&chat_id, "main")),
                 endpoint: None,
                 fast: fast_mode,
+                provider,
                 session_id: Some(format!("rhea-{chat_id}")),
                 inbox: Some(Box::new(move || tools::team_inbox(team::MAIN, &inbox_chat, &last_status))),
                 on_stop: Some(Box::new(move |answer| {
@@ -985,8 +988,12 @@ impl RheaApp {
                         .block
                 })),
             };
-            let result = auth::token().and_then(|tokens| chat::respond_with_options(
-                &tokens.access_token, tokens.account_id.as_deref(), &model, &reasoning_effort, context_window,
+            let credential = match provider {
+                Provider::ChatGpt => auth::token().map(|tokens| (tokens.access_token, tokens.account_id)),
+                Provider::OpenCode => opencode::load_api_key().map(|key| (key, None)).ok_or_else(|| "OpenCode is not connected. Add an API key in Settings > Connections.".to_owned()),
+            };
+            let result = credential.and_then(|(access_token, account_id)| chat::respond_with_options(
+                &access_token, account_id.as_deref(), &model, &reasoning_effort, context_window,
                 &summary, &history, &prompt, &extra_tools,
                 |name, arguments| tools::dispatch(&tool_context, name, arguments),
                 options,
@@ -1728,11 +1735,11 @@ impl RheaApp {
                             }
                         }
                         let fallback = match self.active_tool.as_deref() {
-                            Some("open_app") => "Rhea opened the requested app, but ChatGPT did not return a text follow-up.".to_owned(),
-                            Some("inspect_desktop") => "Rhea inspected the desktop, but ChatGPT did not return a text follow-up.".to_owned(),
-                            Some("list_processes") => "Rhea checked the running apps, but ChatGPT did not return a text follow-up.".to_owned(),
-                            Some(_) => "Rhea completed a local step, but ChatGPT did not return a text follow-up.".to_owned(),
-                            None => "ChatGPT completed without a visible response. Please regenerate the reply.".to_owned(),
+                            Some("open_app") => "Rhea opened the requested app, but the model did not return a text follow-up.".to_owned(),
+                            Some("inspect_desktop") => "Rhea inspected the desktop, but the model did not return a text follow-up.".to_owned(),
+                            Some("list_processes") => "Rhea checked the running apps, but the model did not return a text follow-up.".to_owned(),
+                            Some(_) => "Rhea completed a local step, but the model did not return a text follow-up.".to_owned(),
+                            None => "The model completed without a visible response. Please regenerate the reply.".to_owned(),
                         };
                         self.finish_empty_assistant(fallback);
                         self.active_tool = None;
@@ -2818,7 +2825,8 @@ impl RheaApp {
                         "OpenCode",
                         &if self.opencode_connected {
                             let models = self.model_list.iter().filter(|m| m.provider == Provider::OpenCode).count();
-                            format!("Connected · {models} models available")
+                            let key = opencode::masked_api_key().map(|key| format!(" · {key}")).unwrap_or_default();
+                            format!("Connected{key} · {models} models available")
                         } else {
                             "Paste an API key from opencode.ai/console to use OpenCode models".into()
                         },

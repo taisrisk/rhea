@@ -551,7 +551,7 @@ impl SseLineBuffer {
 /// Read a streaming response without pinning the chat worker in a blocking socket read.
 /// The short poll timeout applies only to each chunk read, not to the total response, so a
 /// long model response remains valid while the UI can still cancel an idle stream promptly.
-fn read_sse_lines_with_cancel(
+pub(crate) fn read_sse_lines_with_cancel(
     runtime: &tokio::runtime::Runtime,
     response: &mut reqwest::Response,
     cancelled: impl Fn() -> bool + Copy,
@@ -587,7 +587,7 @@ fn read_sse_lines_with_cancel(
     }
 }
 
-fn send_chat_request_with_cancel(
+pub(crate) fn send_chat_request_with_cancel(
     runtime: &tokio::runtime::Runtime,
     request: reqwest::RequestBuilder,
     cancelled: impl Fn() -> bool + Copy,
@@ -681,8 +681,11 @@ pub struct RunOptions {
     pub ledger: Option<crate::ledger::Ledger>,
     /// The Responses endpoint; the ChatGPT backend unless a test points it at a scripted server.
     pub endpoint: Option<String>,
-    /// Fast mode: priority processing (about 1.5x speed, more usage).
+    /// Fast mode: asks for priority processing; speed/usage effect is unverified (see `Model`'s
+    /// own doc comment in app.rs).
     pub fast: bool,
+    /// Which backend `access_token` actually authenticates against.
+    pub provider: Provider,
 }
 
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -919,6 +922,7 @@ fn respond_inner(
     let mut stop_retries = 0_u8;
     let mut last_input_tokens = 0_u64;
     let mut answer = String::new();
+    let mut buffered_research_text = String::new();
     let mut call_sequence = 0_u64;
     let mut message_sequence = 0_u64;
     let mut desktop_send_attempted = false;
@@ -968,7 +972,7 @@ fn respond_inner(
             }
         }
         let tools_for_round = request_tools(&tools, compose_active, &options.hidden_tools);
-        // Measure one ChatGPT round trip at a time. The total Rhea task may
+        // Measure one model round trip at a time. The total Rhea task may
         // include several model rounds and local tool execution, so it must
         // not be presented as a single model-request duration.
         let request_started = Instant::now();
@@ -981,149 +985,28 @@ fn respond_inner(
         } else {
             json!("auto")
         };
-        // This private ChatGPT backend refuses `store: true`, so Rhea re-sends its
-        // persisted local history on each turn. The stable key is cache affinity, not a
-        // server-issued conversation/session id and not a guarantee of server-held history.
-        let mut response = loop {
-            let mut body = json!({"model":model,"reasoning":{"effort":reasoning_effort},"input":input,"tools":tools_for_round,"tool_choice":tool_choice,"parallel_tool_calls":false,"store":false,"stream":true});
-            if let Some(session) = options.session_id.as_deref() {
-                body["prompt_cache_key"] = json!(session);
-            }
-            if fast_on {
-                body["service_tier"] = json!(FAST_SERVICE_TIER);
-            }
-            let mut request = stream_http.post(options.endpoint.as_deref().unwrap_or(RESPONSES_URL))
-                .bearer_auth(access_token)
-                .header("originator", "codex_cli_rs")
-                .header(reqwest::header::USER_AGENT, format!("Rhea/{}", env!("CARGO_PKG_VERSION")))
-                .header(reqwest::header::ACCEPT, "text/event-stream")
-                .json(&body);
-            if let Some(session) = options.session_id.as_deref() {
-                request = request.header("session_id", session);
-            }
-            if let Some(id) = account_id {
-                request = request.header("ChatGPT-Account-ID", id);
-            }
-            match send_chat_request_with_cancel(&runtime, request, crate::jev::cancel_requested) {
-                // The backend does not take fast mode for this model or account: go on at normal
-                // speed, and say so once instead of failing the run.
-                Err(error) if fast_on && error.contains("service_tier") => {
-                    fast_on = false;
-                    send(StreamEvent {
-                        notice: Some("Fast mode is not available for this model or account; continuing at normal speed.".into()),
-                        fast_unavailable: true,
-                        ..Default::default()
-                    });
-                }
-                other => break other?,
-            }
-        };
-
-        let mut completed_output: Option<Vec<Value>> = None;
-        let mut buffered_research_text = String::new();
-        read_sse_lines_with_cancel(
-            &runtime,
-            &mut response,
-            crate::jev::cancel_requested,
-            |line| {
-                let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
-                    return Ok(());
-                };
-                if payload.is_empty() || payload == "[DONE]" {
-                    return Ok(());
-                }
-                let event: Value = match serde_json::from_str(payload) {
-                    Ok(value) => value,
-                    Err(_) => return Ok(()),
-                };
-                match event.get("type").and_then(Value::as_str).unwrap_or("") {
-                    "response.output_text.delta" => {
-                        if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                            if research_task {
-                                // Do not show a promise like "I'll research this" as
-                                // if it were a result. Research prose is released only
-                                // after this turn has received actual source evidence.
-                                buffered_research_text.push_str(delta);
-                            } else {
-                                answer.push_str(delta);
-                                send(StreamEvent {
-                                    delta: Some(delta.to_owned()),
-                                    ..Default::default()
-                                });
-                                visible_delta_sent = true;
-                            }
-                        }
-                    }
-                    "response.output_text.done" => {
-                        if research_task {
-                            if buffered_research_text.is_empty() {
-                                if let Some(text) = event.get("text").and_then(Value::as_str) {
-                                    buffered_research_text.push_str(text);
-                                }
-                            }
-                        } else if answer.is_empty() {
-                            if let Some(text) = event.get("text").and_then(Value::as_str) {
-                                answer.push_str(text);
-                                if !text.is_empty() {
-                                    send(StreamEvent {
-                                        delta: Some(text.to_owned()),
-                                        ..Default::default()
-                                    });
-                                    visible_delta_sent = true;
-                                }
-                            }
-                        }
-                    }
-                    "response.completed" => {
-                        let response_value = event.get("response").unwrap_or(&event);
-                        completed_output = response_value
-                            .get("output")
-                            .and_then(Value::as_array)
-                            .cloned();
-                        if research_task {
-                            if buffered_research_text.is_empty() {
-                                if let Some(text) =
-                                    response_value.get("output_text").and_then(Value::as_str)
-                                {
-                                    buffered_research_text.push_str(text);
-                                }
-                            }
-                        } else if answer.is_empty() {
-                            if let Some(text) =
-                                response_value.get("output_text").and_then(Value::as_str)
-                            {
-                                answer.push_str(text);
-                            }
-                        }
-                        completion_diagnostics = response_diagnostics(response_value);
-                        if let Some(usage) = parse_usage(response_value.get("usage")) {
-                            last_input_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
-                            send(StreamEvent {
-                                usage: Some(usage),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                    "response.failed" | "response.incomplete" | "error" => {
-                        let error = stream_error(&event);
-                        send(StreamEvent {
-                            error: Some(error.clone()),
-                            ..Default::default()
-                        });
-                        return Err(error);
-                    }
-                    _ => {}
-                }
-                Ok(())
-            },
-        )?;
-
+        let round = match options.provider {
+            Provider::ChatGpt => chatgpt_round(
+                &runtime, &stream_http, access_token, account_id, model, reasoning_effort, input, &tools_for_round, &tool_choice,
+                options.endpoint.as_deref(), options.session_id.as_deref(), &mut fast_on, research_task, &mut answer, &mut visible_delta_sent, send,
+            ),
+            Provider::OpenCode => crate::opencode::chat_round(
+                &runtime, &stream_http, access_token, model, input, &tools_for_round, options.endpoint.as_deref(), research_task, &mut answer, &mut visible_delta_sent, send,
+            ),
+        }?;
         send(StreamEvent {
             latency_ms: Some(request_started.elapsed().as_millis()),
             ..Default::default()
         });
-        let output =
-            completed_output.ok_or("The response stream ended before response.completed.")?;
+        completion_diagnostics = round.diagnostics;
+        if let Some(tokens) = round.usage_tokens {
+            last_input_tokens = tokens;
+        }
+        // Fresh every round, like the model round's own locally-scoped buffer it replaces: a
+        // round with no buffered research text (a tool-call-only round, or a non-research task)
+        // must not leave an earlier round's leftover text in place.
+        buffered_research_text = round.research_text;
+        let output = round.output;
         let calls: Vec<Value> = output
             .iter()
             .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
@@ -1176,7 +1059,7 @@ fn respond_inner(
                 };
                 if answer.trim().is_empty() {
                     return Err(format!(
-                        "ChatGPT completed this request without a visible reply. {completion_diagnostics}"
+                        "The model completed this request without a visible reply. {completion_diagnostics}"
                     ));
                 }
                 send(StreamEvent {
@@ -1194,7 +1077,7 @@ fn respond_inner(
                 answer = completed_text(&output);
                 if answer.trim().is_empty() {
                     return Err(format!(
-                        "ChatGPT completed this request without a visible reply. {completion_diagnostics}"
+                        "The model completed this request without a visible reply. {completion_diagnostics}"
                     ));
                 }
                 send(StreamEvent {
@@ -1450,6 +1333,184 @@ fn respond_inner(
             return Ok(answer);
         }
     }
+}
+
+/// What one model round produces, in the shape the rest of the loop (tool dispatch, the research
+/// evidence gate, the ledger, compaction) already expects regardless of which provider answered:
+/// a Responses-API-shaped `output` array (`{"type":"function_call",...}` / `{"type":"message",...}`
+/// items), since Rhea's own local transcript - not provider-held state - is what carries context
+/// across a round, a tool call, or a switch from one provider's model to another's mid-chat.
+#[derive(Default)]
+pub(crate) struct RoundOutcome {
+    pub(crate) output: Vec<Value>,
+    pub(crate) diagnostics: String,
+    pub(crate) usage_tokens: Option<u64>,
+    /// Text buffered for a research task, released only once actual evidence has been seen
+    /// (never shown as if it were a result on its own).
+    pub(crate) research_text: String,
+}
+
+/// One ChatGPT round: POST the Responses API, stream its events into `send` and `answer`/
+/// `visible_delta_sent`, and return the completed output array.
+#[allow(clippy::too_many_arguments)]
+fn chatgpt_round(
+    runtime: &tokio::runtime::Runtime,
+    stream_http: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    model: &str,
+    reasoning_effort: &str,
+    input: &[Value],
+    tools_for_round: &Value,
+    tool_choice: &Value,
+    endpoint: Option<&str>,
+    session_id: Option<&str>,
+    fast_on: &mut bool,
+    research_task: bool,
+    answer: &mut String,
+    visible_delta_sent: &mut bool,
+    send: &impl Fn(StreamEvent),
+) -> Result<RoundOutcome, String> {
+    // This private ChatGPT backend refuses `store: true`, so Rhea re-sends its
+    // persisted local history on each turn. The stable key is cache affinity, not a
+    // server-issued conversation/session id and not a guarantee of server-held history.
+    let mut response = loop {
+        let mut body = json!({"model":model,"reasoning":{"effort":reasoning_effort},"input":input,"tools":tools_for_round,"tool_choice":tool_choice,"parallel_tool_calls":false,"store":false,"stream":true});
+        if let Some(session) = session_id {
+            body["prompt_cache_key"] = json!(session);
+        }
+        if *fast_on {
+            body["service_tier"] = json!(FAST_SERVICE_TIER);
+        }
+        let mut request = stream_http.post(endpoint.unwrap_or(RESPONSES_URL))
+            .bearer_auth(access_token)
+            .header("originator", "codex_cli_rs")
+            .header(reqwest::header::USER_AGENT, format!("Rhea/{}", env!("CARGO_PKG_VERSION")))
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(&body);
+        if let Some(session) = session_id {
+            request = request.header("session_id", session);
+        }
+        if let Some(id) = account_id {
+            request = request.header("ChatGPT-Account-ID", id);
+        }
+        match send_chat_request_with_cancel(runtime, request, crate::jev::cancel_requested) {
+            // The backend does not take fast mode for this model or account: go on at normal
+            // speed, and say so once instead of failing the run.
+            Err(error) if *fast_on && error.contains("service_tier") => {
+                *fast_on = false;
+                send(StreamEvent {
+                    notice: Some("Fast mode is not available for this model or account; continuing at normal speed.".into()),
+                    fast_unavailable: true,
+                    ..Default::default()
+                });
+            }
+            other => break other?,
+        }
+    };
+
+    let mut outcome = RoundOutcome::default();
+    read_sse_lines_with_cancel(
+        runtime,
+        &mut response,
+        crate::jev::cancel_requested,
+        |line| {
+            let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+                return Ok(());
+            };
+            if payload.is_empty() || payload == "[DONE]" {
+                return Ok(());
+            }
+            let event: Value = match serde_json::from_str(payload) {
+                Ok(value) => value,
+                Err(_) => return Ok(()),
+            };
+            match event.get("type").and_then(Value::as_str).unwrap_or("") {
+                "response.output_text.delta" => {
+                    if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                        if research_task {
+                            // Do not show a promise like "I'll research this" as
+                            // if it were a result. Research prose is released only
+                            // after this turn has received actual source evidence.
+                            outcome.research_text.push_str(delta);
+                        } else {
+                            answer.push_str(delta);
+                            send(StreamEvent {
+                                delta: Some(delta.to_owned()),
+                                ..Default::default()
+                            });
+                            *visible_delta_sent = true;
+                        }
+                    }
+                }
+                "response.output_text.done" => {
+                    if research_task {
+                        if outcome.research_text.is_empty() {
+                            if let Some(text) = event.get("text").and_then(Value::as_str) {
+                                outcome.research_text.push_str(text);
+                            }
+                        }
+                    } else if answer.is_empty() {
+                        if let Some(text) = event.get("text").and_then(Value::as_str) {
+                            answer.push_str(text);
+                            if !text.is_empty() {
+                                send(StreamEvent {
+                                    delta: Some(text.to_owned()),
+                                    ..Default::default()
+                                });
+                                *visible_delta_sent = true;
+                            }
+                        }
+                    }
+                }
+                "response.completed" => {
+                    let response_value = event.get("response").unwrap_or(&event);
+                    outcome.output = response_value
+                        .get("output")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    if research_task {
+                        if outcome.research_text.is_empty() {
+                            if let Some(text) =
+                                response_value.get("output_text").and_then(Value::as_str)
+                            {
+                                outcome.research_text.push_str(text);
+                            }
+                        }
+                    } else if answer.is_empty() {
+                        if let Some(text) =
+                            response_value.get("output_text").and_then(Value::as_str)
+                        {
+                            answer.push_str(text);
+                        }
+                    }
+                    outcome.diagnostics = response_diagnostics(response_value);
+                    if let Some(usage) = parse_usage(response_value.get("usage")) {
+                        outcome.usage_tokens = Some(usage.input_tokens.saturating_add(usage.output_tokens));
+                        send(StreamEvent {
+                            usage: Some(usage),
+                            ..Default::default()
+                        });
+                    }
+                }
+                "response.failed" | "response.incomplete" | "error" => {
+                    let error = stream_error(&event);
+                    send(StreamEvent {
+                        error: Some(error.clone()),
+                        ..Default::default()
+                    });
+                    return Err(error);
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    )?;
+    if outcome.diagnostics.is_empty() {
+        return Err("The response stream ended before response.completed.".into());
+    }
+    Ok(outcome)
 }
 
 /// The user-facing reply for a plan Rhea completed, or None when the plan

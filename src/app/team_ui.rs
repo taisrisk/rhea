@@ -134,6 +134,7 @@ impl RheaApp {
             effort: self.reasoning_effort.clone(),
             context_window: self.context_window,
             fast: self.fast_mode,
+            provider: self.model_list.iter().find(|m| m.slug == self.selected_model).map(|m| m.provider).unwrap_or_default(),
             compose: self.compose_mode,
             subagent_model: self.subagent_model.clone(),
             compact_percent: self.compact_percent,

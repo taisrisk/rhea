@@ -14,6 +14,7 @@
 | [Shell and sessions](shell-and-sessions.md) | `run_command`, plans that mix shell and GUI steps, session ids |
 | [MCP servers](mcp.md) | Importing and managing servers, the Chrome bridge and Shell connection |
 | [Usage and fast mode](usage.md) | Lifetime usage, the 3-month activity grid, where tokens went, fast mode |
+| [OpenCode](opencode.md) | A second model provider: API key, the grouped model picker, switching models without losing context |
 | [Runs, evidence and testing](runs.md) | The run ledger, what counts as research evidence, desktop retries, replay tests |
 | [Chats and archives](chats.md) | New chats, the `…` menu, archiving, the open-file cache |
 | [Spell check and autocorrect](spelling.md) | Underlines, suggestions, the learning rules |

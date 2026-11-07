@@ -4,6 +4,7 @@
 | --- | --- |
 | `src/app.rs`, `src/app/` | The window: chat, history, settings pages (`chrome_ui`, `laya_ui`, `archive_ui`, `team_ui`), motion helpers (`motion`) |
 | `src/chat.rs` | Model catalog, streamed responses, tool-call loop, context handling |
+| `src/opencode.rs` | OpenCode as a second provider: API key auth, model catalog, Chat Completions wire translation |
 | `src/chat_store.rs` | Per-chat files, the open-file cache, archives, migration |
 | `src/jev.rs` | Local tool routing and bounded desktop plans |
 | `src/usage.rs` | Lifetime usage record (`usage.json`): daily totals, streaks, activity grid, token breakdown |
