@@ -31,7 +31,7 @@ raw-window-handle = "0.6.2"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_System_SystemInformation"] }
 # UI Automation COM bindings (already in the dependency graph): read the focused
 # control in milliseconds instead of a multi-second agent-desktop tree walk.
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_JobObjects", "Win32_Security"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Native pointer/keyboard events (the same version eframe already pulls in on macOS).

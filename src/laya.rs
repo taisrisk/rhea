@@ -10,7 +10,10 @@
 //!   2. `pip install laya[serve]` puts the model code and PyTorch into it,
 //!   3. the model weights are fetched from Hugging Face into `~/.rhea/laya/hf`,
 //!   4. `python -m laya.serve` is started on a free loopback port with a random bearer token and
-//!      stopped again when Rhea closes.
+//!      stopped again when Rhea closes. On Windows it is also assigned to a Job Object tied to
+//!      Rhea's own process, so a crash or a forced kill of Rhea takes it down too instead of
+//!      leaving it running (Task Manager still lists it under its own name - "python.exe" - since
+//!      Windows never nests a different executable under the process that started it).
 //! Everything stays under `~/.rhea/laya`; deleting that folder removes it completely.
 
 use std::{
@@ -215,6 +218,51 @@ fn quiet(command: &mut Command) -> &mut Command {
     command
 }
 
+/// A Windows Job Object that kills whatever is assigned to it the moment Rhea's own process ends,
+/// crash included - Task Manager still lists Laya's Python under its own name (it is a different
+/// executable, which Windows never nests under the process that started it), but it can never
+/// outlive Rhea as an orphan the way a plain child process can if Rhea is killed rather than closed
+/// normally.
+#[cfg(windows)]
+fn kill_with_rhea_job() -> windows::Win32::Foundation::HANDLE {
+    use windows::Win32::{
+        Foundation::HANDLE,
+        System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        },
+    };
+    static JOB: OnceLock<usize> = OnceLock::new();
+    let handle = *JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(None, None).unwrap_or(HANDLE(std::ptr::null_mut()));
+        if !job.is_invalid() {
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let _ = SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32);
+        }
+        job.0 as usize
+    });
+    HANDLE(handle as *mut _)
+}
+
+/// Tie `child`'s lifetime to Rhea's own: if Rhea is killed (crash, task-ended, power loss handled
+/// by the next launch's `kill_orphan`) rather than exiting normally through `stop()`, Windows tears
+/// this process down with it instead of leaving it running.
+#[cfg(windows)]
+fn tie_to_rhea(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{Foundation::HANDLE, System::JobObjects::AssignProcessToJobObject};
+    let job = kill_with_rhea_job();
+    if !job.is_invalid() {
+        let process = HANDLE(child.as_raw_handle());
+        unsafe {
+            let _ = AssignProcessToJobObject(job, process);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn tie_to_rhea(_child: &Child) {}
+
 /// Run the private Python, showing its output lines as the step's detail.
 fn run_python(arguments: &[&str], label: &str) -> Result<(), String> {
     let mut command = Command::new(python_exe());
@@ -401,6 +449,7 @@ pub fn start() -> Result<u16, String> {
     command.args(["-m", "laya.serve"]).envs(server_env(port, &token, "auto")).current_dir(root()).stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(log_err));
     quiet(&mut command);
     let child = command.spawn().map_err(|error| format!("Could not start the local model: {error}"))?;
+    tie_to_rhea(&child);
     let _ = fs::write(pid_path(), child.id().to_string());
     *server_cell().lock().unwrap_or_else(|p| p.into_inner()) = Some(Running { child, port, token: token.clone() });
     let started = Instant::now();
