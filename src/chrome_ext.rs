@@ -207,6 +207,50 @@ pub fn check() -> Status {
     }
 }
 
+/// Every profile folder Chrome has (`Default`, `Profile 1`, `Profile 2`, ...). An extension is
+/// per-profile in Chrome, so having it in one profile never makes it appear in another.
+pub fn all_profiles() -> Vec<String> {
+    let Some(root) = chrome_user_data() else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(&root) else { return Vec::new() };
+    let mut profiles: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().join("Preferences").is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name == "Default" || name.starts_with("Profile "))
+        .collect();
+    profiles.sort();
+    profiles
+}
+
+/// Open `chrome://extensions` once per profile Chrome has, each its own window, since Chrome never
+/// shares an unpacked extension across profiles: each one needs its own Load Unpacked click.
+/// Returns how many windows it opened.
+pub fn open_extensions_in_every_profile() -> Result<usize, String> {
+    let profiles = all_profiles();
+    if profiles.is_empty() {
+        return open_extensions_page().map(|()| 1);
+    }
+    let mut opened = 0;
+    for profile in &profiles {
+        let mut args = open_args("chrome://extensions", Some(profile));
+        args.push("--new-window".into());
+        #[cfg(target_os = "macos")]
+        let spawned = std::process::Command::new("open").args(["-na", "Google Chrome", "--args"]).args(&args).spawn().is_ok();
+        #[cfg(not(target_os = "macos"))]
+        let spawned = match chrome_executable() {
+            Some(chrome) => std::process::Command::new(chrome).args(&args).spawn().is_ok(),
+            None => return Err("Google Chrome was not found in its default location. Install Chrome first.".into()),
+        };
+        if spawned {
+            opened += 1;
+        }
+    }
+    if opened == 0 {
+        return Err("Could not open Chrome.".into());
+    }
+    Ok(opened)
+}
+
 /// The profile Chrome should open: the one that already has the extension, else the one used last.
 /// Naming it keeps Chrome from stopping at its "Who's using Chrome?" picker when a URL is passed.
 fn profile_to_open() -> Option<String> {
@@ -307,6 +351,17 @@ mod tests {
         let disabled = json!({"extensions": {"settings": {browser::BUNDLED_EXTENSION_ID: {"state": 0}}}});
         assert!(!entry_in(&disabled, "Default").unwrap().enabled);
         assert!(entry_in(&json!({"extensions": {"settings": {}}}), "Default").is_none());
+    }
+
+    #[test]
+    fn every_profile_opens_in_its_own_named_window() {
+        // Mirrors what open_extensions_in_every_profile() builds per profile: a window per
+        // profile, each named so Chrome never stops at its "Who's using Chrome?" picker.
+        for profile in ["Default", "Profile 1", "Profile 2"] {
+            let mut args = open_args("chrome://extensions", Some(profile));
+            args.push("--new-window".into());
+            assert_eq!(args, [format!("--profile-directory={profile}"), "chrome://extensions".into(), "--new-window".into()]);
+        }
     }
 
     #[test]

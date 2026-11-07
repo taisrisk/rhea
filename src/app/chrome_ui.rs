@@ -62,6 +62,24 @@ impl RheaApp {
                     self.notice = chrome_ext::open_extensions_page().map(|()| "Opened chrome://extensions · the folder path is copied.".to_owned()).unwrap_or_else(|error| error);
                 }
             });
+            let profiles = chrome_ext::all_profiles();
+            if status.chrome_found && profiles.len() > 1 {
+                row_divider(ui);
+                settings_row(
+                    ui,
+                    None,
+                    "Every Chrome profile",
+                    &format!("You have {} Chrome profiles. An extension is per-profile in Chrome, so each needs its own Load unpacked click.", profiles.len()),
+                    |ui| {
+                        if action_button(ui, "globe", "Open all", false).clicked() {
+                            ui.ctx().copy_text(folder.display().to_string());
+                            self.notice = chrome_ext::open_extensions_in_every_profile()
+                                .map(|count| format!("Opened chrome://extensions in {count} profiles · the folder path is copied. Load unpacked once in each."))
+                                .unwrap_or_else(|error| error);
+                        }
+                    },
+                );
+            }
         });
         ui.add(egui::Label::new(egui::RichText::new("Rhea acts only on tabs the extension can see, and never reads saved passwords or cookies.").size(10.5).color(MUTED)).wrap());
     }
