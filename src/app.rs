@@ -32,13 +32,13 @@ use team_ui::{AskUi, SideTab, title_case};
 
 use crate::{
     auth, browser,
-    chat::{self, Model, Turn},
+    chat::{self, Model, Provider, Turn},
     chat_store,
     desktop::{self, SnapshotResult},
     hooks::{HookEvent, HookRegistry},
     ledger,
     mcp::{self, McpManager, McpServerConfig},
-    skills, team, tools,
+    opencode, skills, team, tools,
 };
 
 /// Every UI transition is this long at most: quick and snappy.
@@ -126,6 +126,8 @@ enum CompletedOperation {
     McpUpdated(String),
     /// Fast mode was on but the service rejected it for this run.
     FastUnavailable,
+    /// OpenCode's model catalog (merged into model_list alongside ChatGPT's, not replacing it).
+    OpenCodeModels(Result<Vec<Model>, String>),
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -311,6 +313,10 @@ pub struct RheaApp {
     started: bool,
     signed_in: bool,
     account: String,
+    /// Whether OpenCode has a saved API key. Cached (not read from the credential store every
+    /// frame - a Keychain read can prompt the user on macOS) and refreshed after save/clear.
+    opencode_connected: bool,
+    opencode_key_draft: String,
     device_code: Option<String>,
     verification_url: String,
     model_list: Vec<Model>,
@@ -452,6 +458,8 @@ impl Default for RheaApp {
             started: false,
             signed_in: false,
             account: String::new(),
+            opencode_connected: opencode::connected(),
+            opencode_key_draft: String::new(),
             device_code: None,
             verification_url: auth::VERIFICATION_URL.to_owned(),
             model_list: Vec::new(),
@@ -586,6 +594,23 @@ impl RheaApp {
         crate::usage::backfill(total);
     }
 
+    /// After the model catalog changes (either provider): keep the selection if it still exists,
+    /// else fall back to the first model, and make the context window and reasoning effort match
+    /// whatever is now selected. Returns a save error, if any, to show in the notice.
+    fn sync_selected_model(&mut self) -> Option<String> {
+        if !self.model_list.iter().any(|m| m.slug == self.selected_model) {
+            self.selected_model = self.model_list.first().map(|m| m.slug.clone()).unwrap_or_default();
+        }
+        if let Some(model) = self.model_list.iter().find(|model| model.slug == self.selected_model) {
+            self.context_window_reported = model.context_limit().is_some();
+            self.context_window = model.context_limit().unwrap_or(chat::DEFAULT_CONTEXT_WINDOW);
+            if !model.supported_reasoning_levels.is_empty() && !model.supported_reasoning_levels.contains(&self.reasoning_effort) {
+                self.reasoning_effort = model.supported_reasoning_levels[0].clone();
+            }
+        }
+        save_selected_model(&self.selected_model, &self.reasoning_effort).err()
+    }
+
     /// `RHEA_DEMO_CONTEXT=memory`: a short chat with memory in its context and a `/compact` that is
     /// finished and one still running, for screenshots of the context panel and the transcript.
     fn seed_demo_context(&mut self) {
@@ -686,8 +711,21 @@ impl RheaApp {
                         });
                     let _ = tx.send(result);
                 }
+                if let Some(key) = opencode::load_api_key() {
+                    let _ = tx.send(Ok(CompletedOperation::OpenCodeModels(opencode::models(&key))));
+                }
             },
             "Rhea started · checking desktop bridge and saved ChatGPT session…",
+        );
+    }
+
+    fn refresh_opencode_models(&mut self) {
+        let Some(key) = opencode::load_api_key() else { return };
+        self.begin(
+            move |tx| {
+                let _ = tx.send(Ok(CompletedOperation::OpenCodeModels(opencode::models(&key))));
+            },
+            "Checking OpenCode and refreshing its model list…",
         );
     }
 
@@ -1487,53 +1525,33 @@ impl RheaApp {
                     Ok(CompletedOperation::SignedOut(message)) => {
                         self.signed_in = false;
                         self.account.clear();
-                        self.model_list.clear();
+                        // Only ChatGPT's models leave; OpenCode's catalog (a separate login) stays.
+                        self.model_list.retain(|model| model.provider != Provider::ChatGpt);
+                        self.sync_selected_model();
                         self.notice = message;
                     }
                     Ok(CompletedOperation::Models(models, ms)) => {
-                        self.model_list = models;
-                        if !self
-                            .model_list
-                            .iter()
-                            .any(|m| m.slug == self.selected_model)
-                        {
-                            self.selected_model = self
-                                .model_list
-                                .first()
-                                .map(|m| m.slug.clone())
-                                .unwrap_or_default();
-                        }
-                        if let Some(model) = self
-                            .model_list
-                            .iter()
-                            .find(|model| model.slug == self.selected_model)
-                        {
-                            self.context_window_reported = model.context_limit().is_some();
-                            self.context_window = model.context_limit().unwrap_or(chat::DEFAULT_CONTEXT_WINDOW);
-                        }
-                        if let Some(model) = self
-                            .model_list
-                            .iter()
-                            .find(|model| model.slug == self.selected_model)
-                        {
-                            if !model.supported_reasoning_levels.is_empty()
-                                && !model
-                                    .supported_reasoning_levels
-                                    .contains(&self.reasoning_effort)
-                            {
-                                self.reasoning_effort = model.supported_reasoning_levels[0].clone();
-                            }
-                        }
-                        let save_error =
-                            save_selected_model(&self.selected_model, &self.reasoning_effort).err();
+                        self.model_list.retain(|model| model.provider != Provider::ChatGpt);
+                        self.model_list.splice(0..0, models);
+                        let save_error = self.sync_selected_model();
                         self.latency_ms = Some(ms);
                         self.signed_in = true;
                         self.notice = save_error.unwrap_or_else(|| {
                             format!(
                                 "ChatGPT connected · {} models available",
-                                self.model_list.len()
+                                self.model_list.iter().filter(|m| m.provider == Provider::ChatGpt).count()
                             )
                         });
+                    }
+                    Ok(CompletedOperation::OpenCodeModels(Ok(models))) => {
+                        self.model_list.retain(|model| model.provider != Provider::OpenCode);
+                        let count = models.len();
+                        self.model_list.extend(models);
+                        let save_error = self.sync_selected_model();
+                        self.notice = save_error.unwrap_or_else(|| format!("OpenCode connected · {count} models available"));
+                    }
+                    Ok(CompletedOperation::OpenCodeModels(Err(error))) => {
+                        self.notice = format!("Could not load OpenCode's model list: {error}");
                     }
                     Ok(CompletedOperation::ChatDelta(delta)) => {
                         if let Some(last) = self
@@ -2790,6 +2808,41 @@ impl RheaApp {
                                     .clicked()
                             {
                                 self.sign_in();
+                            }
+                        },
+                    );
+                    row_divider(ui);
+                    settings_row(
+                        ui,
+                        Some(if self.opencode_connected { HOVER_GREEN } else { DANGER }),
+                        "OpenCode",
+                        &if self.opencode_connected {
+                            let models = self.model_list.iter().filter(|m| m.provider == Provider::OpenCode).count();
+                            format!("Connected · {models} models available")
+                        } else {
+                            "Paste an API key from opencode.ai/console to use OpenCode models".into()
+                        },
+                        |ui| {
+                            if self.opencode_connected {
+                                if ui.add_enabled_ui(self.pending.is_none(), |ui| action_button(ui, "refresh", "Refresh models", false)).inner.clicked() {
+                                    self.refresh_opencode_models();
+                                }
+                                if action_button(ui, "x", "Disconnect", false).clicked() {
+                                    self.notice = opencode::clear_api_key().map(|()| "OpenCode disconnected.".to_owned()).unwrap_or_else(|error| error);
+                                    self.opencode_connected = opencode::connected();
+                                    self.model_list.retain(|model| model.provider != Provider::OpenCode);
+                                    self.sync_selected_model();
+                                }
+                            } else {
+                                ui.add(egui::TextEdit::singleline(&mut self.opencode_key_draft).hint_text(egui::RichText::new("sk-...").color(MUTED)).password(true).desired_width(160.0));
+                                if ui.add_enabled_ui(!self.opencode_key_draft.trim().is_empty(), |ui| action_button(ui, "link", "Connect", true)).inner.clicked() {
+                                    self.notice = opencode::save_api_key(&self.opencode_key_draft).map(|()| "OpenCode key saved · loading its model list…".to_owned()).unwrap_or_else(|error| error);
+                                    self.opencode_key_draft.clear();
+                                    self.opencode_connected = opencode::connected();
+                                    if self.opencode_connected {
+                                        self.refresh_opencode_models();
+                                    }
+                                }
                             }
                         },
                     );
@@ -4356,7 +4409,16 @@ impl RheaApp {
                         .max_height(220.0 * turn)
                         .auto_shrink([false, true])
                         .show(popup, |list| {
+                            let mut last_provider: Option<Provider> = None;
                             for model in &models {
+                                if last_provider != Some(model.provider) {
+                                    if last_provider.is_some() {
+                                        list.add_space(4.0);
+                                    }
+                                    last_provider = Some(model.provider);
+                                    list.label(egui::RichText::new(model.provider.label()).size(9.5).strong().color(MUTED));
+                                    list.add_space(2.0);
+                                }
                                 let is_current = model.slug == self.selected_model;
                                 let (item, response) = list.allocate_exact_size(
                                     Vec2::new(list.available_width(), 30.0),
@@ -4380,6 +4442,17 @@ impl RheaApp {
                                         Color32::from_rgb(196, 198, 196)
                                     },
                                 );
+                                // The context window, muted so the name stays the thing the eye lands on.
+                                let context_right = if is_current { item.right() - 34.0 } else { item.right() - 11.0 };
+                                if let Some(limit) = model.context_limit() {
+                                    list.painter().text(
+                                        pos2(context_right, item.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        format_tokens(limit),
+                                        egui::FontId::proportional(10.5),
+                                        MUTED,
+                                    );
+                                }
                                 if is_current {
                                     paint_icon(
                                         list.painter(),
