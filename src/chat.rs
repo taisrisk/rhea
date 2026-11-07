@@ -471,6 +471,9 @@ pub struct StreamEvent {
     pub compaction: Option<CompactionUpdate>,
     /// A short message for the status line (not part of the reply).
     pub notice: Option<String>,
+    /// Fast mode was requested but the service rejected `service_tier` and the run fell back to
+    /// normal speed. Usage should count this run as normal, not fast, even though the setting is on.
+    pub fast_unavailable: bool,
 }
 
 const STREAM_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -983,7 +986,11 @@ fn respond_inner(
                 // speed, and say so once instead of failing the run.
                 Err(error) if fast_on && error.contains("service_tier") => {
                     fast_on = false;
-                    send(StreamEvent { notice: Some("Fast mode is not available for this model or account; continuing at normal speed.".into()), ..Default::default() });
+                    send(StreamEvent {
+                        notice: Some("Fast mode is not available for this model or account; continuing at normal speed.".into()),
+                        fast_unavailable: true,
+                        ..Default::default()
+                    });
                 }
                 other => break other?,
             }

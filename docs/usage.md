@@ -15,7 +15,7 @@ The first time this record is created it starts from the tokens the chats you al
 
 ## Fast mode
 
-The bolt button next to "Thinking" in the model popup turns fast mode on or off (it is remembered). Hovering it says "1.5x speed · More usage". When it is on, requests ask ChatGPT for priority processing (`service_tier: "priority"`), which is faster and uses more of your plan. If the service refuses the option for a model or account, Rhea tells you once and carries on at normal speed instead of failing the run. Subagents follow the same setting.
+The bolt button next to "Thinking" in the model popup turns fast mode on or off (it is remembered). When it is on, requests ask ChatGPT for priority processing (`service_tier: "priority"`). OpenAI documents that parameter for its public API, not for the private `chatgpt.com` backend Rhea actually talks to, so the real speed and usage effect here are unverified — the tooltip now says "priority processing, when the account supports it" rather than claiming a specific multiplier. If the service explicitly rejects the option (an error mentioning `service_tier`) for a model or account, Rhea tells you once, carries on at normal speed, and no longer counts that run as fast in Settings > Usage. This only catches an explicit rejection — the backend does not echo back which tier it actually used, so a silent downgrade the service makes without erroring would still be counted as fast; that gap is still open. Subagents follow the same setting.
 
 ## Model limits
 

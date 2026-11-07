@@ -103,16 +103,28 @@ fn hash_of(value: &impl std::hash::Hash) -> u64 {
     hasher.finish()
 }
 
+/// How many distinct pieces of evidence the request actually asked for. "Find 10 games" means 10,
+/// not however many happen to qualify; a plural noun with no number attached still means "more than
+/// one," which was the old floor and stays as a fallback.
 pub(crate) fn required_research_evidence_rows(request: &str) -> usize {
     let text = request.to_ascii_lowercase();
-    if text
-        .split(|ch: char| !ch.is_alphanumeric())
-        .any(|word| matches!(word, "games" | "options" | "items" | "sources"))
-    {
-        2
-    } else {
-        1
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for (index, word) in words.iter().enumerate() {
+        let clean = word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+        if !matches!(clean, "games" | "options" | "items" | "sources" | "results") {
+            continue;
+        }
+        // A count up to a few words back ("find me 10 games", "the top 5 options") is the real
+        // target; anything further back is unrelated and falls back to the "more than one" floor.
+        let start = index.saturating_sub(3);
+        if let Some(count) = words[start..index].iter().rev().find_map(|token| parse_threshold_token(token)) {
+            if count >= 1.0 && count.is_finite() {
+                return count as usize;
+            }
+        }
+        return 2;
     }
+    1
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,6 +399,16 @@ mod tests {
         let more = json!({"ok": true, "text": "Blox Fruits has 44,000 active players."});
         assert_eq!(log.add("browser__extract", &more, request).map(|e| e.rows), Some(1));
         assert_eq!(log.rows(), 3);
+    }
+
+    #[test]
+    fn required_rows_follow_the_count_actually_requested() {
+        assert_eq!(required_research_evidence_rows("find me 10 games with more than 1K players"), 10, "the requested count, not the old flat floor of 2");
+        assert_eq!(required_research_evidence_rows("list the top 5 options"), 5);
+        assert_eq!(required_research_evidence_rows("find 3 sources for this"), 3);
+        assert_eq!(required_research_evidence_rows("find games with more than 1K players"), 2, "a plural noun with no count still means more than one");
+        assert_eq!(required_research_evidence_rows("what is the weather in Tokyo"), 1);
+        assert_eq!(required_research_evidence_rows("give me 4 results"), 4);
     }
 
     #[test]

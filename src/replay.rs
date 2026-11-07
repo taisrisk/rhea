@@ -100,6 +100,8 @@ struct Replay {
     ledger: Vec<Entry>,
     /// Tool names the loop asked to run, in order.
     ran: Vec<String>,
+    /// Whether the loop told the caller fast mode was rejected for this run.
+    fast_unavailable: bool,
 }
 
 impl Replay {
@@ -123,6 +125,8 @@ fn replay_with(replies: Vec<String>, message: &str, fast: bool, mut tool: impl F
     let sink = Arc::clone(&shown);
     let ran = Arc::new(Mutex::new(Vec::new()));
     let ran_log = Arc::clone(&ran);
+    let fast_unavailable = Arc::new(Mutex::new(false));
+    let fast_unavailable_sink = Arc::clone(&fast_unavailable);
     let answer = respond_with_options(
         "test-token",
         None,
@@ -142,13 +146,17 @@ fn replay_with(replies: Vec<String>, message: &str, fast: bool, mut tool: impl F
             if let Some(delta) = event.delta {
                 sink.lock().unwrap().push_str(&delta);
             }
+            if event.fast_unavailable {
+                *fast_unavailable_sink.lock().unwrap() = true;
+            }
         },
     );
     let requests = bodies.lock().unwrap().clone();
     let ledger = std::fs::read_to_string(&path).unwrap_or_default().lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
     let shown = shown.lock().unwrap().clone();
     let ran = ran.lock().unwrap().clone();
-    Replay { answer, requests, shown, ledger, ran }
+    let fast_unavailable = *fast_unavailable.lock().unwrap();
+    Replay { answer, requests, shown, ledger, ran, fast_unavailable }
 }
 
 fn ends_with(replay: &Replay, status: &str) -> bool {
@@ -172,6 +180,7 @@ fn fast_mode_asks_for_priority_processing_and_normal_mode_does_not() {
     let fast = replay_with(vec![says("quick")], "hello", true, |_, _| unreachable!());
     assert_eq!(fast.answer.as_deref(), Ok("quick"));
     assert_eq!(fast.requests[0]["service_tier"], json!("priority"));
+    assert!(!fast.fast_unavailable, "the service accepted it without complaint");
     let normal = replay(vec![says("steady")], "hello", |_, _| unreachable!());
     assert!(normal.requests[0].get("service_tier").is_none());
 }
@@ -184,9 +193,11 @@ fn a_backend_that_refuses_fast_mode_gets_the_same_request_at_normal_speed() {
     assert_eq!(run.requests.len(), 2);
     assert_eq!(run.requests[0]["service_tier"], json!("priority"));
     assert!(run.requests[1].get("service_tier").is_none(), "retried without it");
+    assert!(run.fast_unavailable, "the caller is told so it does not count this run as fast");
     // Any other refusal still fails the run.
     let other = replay_with(vec![r#"ERR:{"error":{"message":"quota exceeded"}}"#.to_owned()], "hello", true, |_, _| unreachable!());
     assert!(other.answer.is_err());
+    assert!(!other.fast_unavailable, "the run simply failed, fast mode was never actually rejected");
 }
 
 #[test]

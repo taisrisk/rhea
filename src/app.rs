@@ -124,6 +124,8 @@ enum CompletedOperation {
     BrowserSnapshot(Value),
     ChatDone,
     McpUpdated(String),
+    /// Fast mode was on but the service rejected it for this run.
+    FastUnavailable,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -355,6 +357,9 @@ pub struct RheaApp {
     jev_latency_ms: Option<u128>,
     jev_action_started: Option<Instant>,
     assistant_started_at: Option<Instant>,
+    /// Fast mode was on for this run but the service rejected it: usage should count it as a
+    /// normal-speed run, not a fast one, even though the setting stayed on.
+    fast_downgraded_this_run: bool,
     notice: String,
     scroll_to_bottom: bool,
     show_settings: bool,
@@ -380,7 +385,8 @@ pub struct RheaApp {
     compacting: Option<CompactRun>,
     /// The latest memory briefing sent: chat, tokens it takes, memories in it.
     memory_context: Option<(String, u64, usize)>,
-    /// Fast mode: priority processing, about 1.5x speed for more usage.
+    /// Fast mode: asks for priority processing; speed and usage impact are not verified against
+    /// this private ChatGPT backend (OpenAI documents the parameter only for its public API).
     fast_mode: bool,
     /// The usage record as drawn on Settings > Usage, refreshed every couple of seconds.
     usage_view: Option<(Instant, crate::usage::Usage)>,
@@ -490,6 +496,7 @@ impl Default for RheaApp {
             jev_latency_ms: None,
             jev_action_started: None,
             assistant_started_at: None,
+            fast_downgraded_this_run: false,
             notice: mcp_load_error.unwrap_or_else(|| {
                 "Rhea is running locally. Connect ChatGPT to start a conversation.".into()
             }),
@@ -831,6 +838,7 @@ impl RheaApp {
         self.history_dirty = true;
         self.streaming = true;
         self.assistant_started_at = Some(Instant::now());
+        self.fast_downgraded_this_run = false;
         self.active_tool = None;
         self.scroll_to_bottom = true;
         self.flush_history(true);
@@ -952,6 +960,7 @@ impl RheaApp {
                     if let Some(usage) = event.usage { let _ = tx.send(Ok(CompletedOperation::ChatUsage(usage))); }
                     if let Some(compaction) = event.compaction { let _ = tx.send(Ok(CompletedOperation::ContextCompacted(compaction))); }
                     if let Some(notice) = event.notice { let _ = tx.send(Ok(CompletedOperation::McpUpdated(notice))); }
+                    if event.fast_unavailable { let _ = tx.send(Ok(CompletedOperation::FastUnavailable)); }
                     if let Some(error) = event.error { let _ = tx.send(Err(error)); }
                 }
             ));
@@ -1417,7 +1426,7 @@ impl RheaApp {
                         if let Some(elapsed) = self.assistant_started_at.take().map(|started| {
                             started.elapsed().as_millis().min(u64::MAX as u128) as u64
                         }) {
-                            crate::usage::record_run(elapsed, &self.reasoning_effort, self.fast_mode);
+                            crate::usage::record_run(elapsed, &self.reasoning_effort, self.fast_mode && !self.fast_downgraded_this_run);
                             if let Some(turn) = self
                                 .conversations
                                 .get_mut(self.active_conversation)
@@ -1689,7 +1698,7 @@ impl RheaApp {
                         if let Some(elapsed) = self.assistant_started_at.take().map(|started| {
                             started.elapsed().as_millis().min(u64::MAX as u128) as u64
                         }) {
-                            crate::usage::record_run(elapsed, &self.reasoning_effort, self.fast_mode);
+                            crate::usage::record_run(elapsed, &self.reasoning_effort, self.fast_mode && !self.fast_downgraded_this_run);
                             if let Some(turn) = self
                                 .conversations
                                 .get_mut(self.active_conversation)
@@ -1716,6 +1725,9 @@ impl RheaApp {
                     }
                     Ok(CompletedOperation::McpUpdated(message)) => {
                         self.notice = message;
+                    }
+                    Ok(CompletedOperation::FastUnavailable) => {
+                        self.fast_downgraded_this_run = true;
                     }
                 }
             }
@@ -1901,7 +1913,7 @@ impl RheaApp {
             .take()
             .map(|started| started.elapsed().as_millis().min(u64::MAX as u128) as u64)
         {
-            crate::usage::record_run(elapsed, &self.reasoning_effort, self.fast_mode);
+            crate::usage::record_run(elapsed, &self.reasoning_effort, self.fast_mode && !self.fast_downgraded_this_run);
             if let Some(turn) = self
                 .conversations
                 .get_mut(self.active_conversation)
@@ -3574,13 +3586,23 @@ impl RheaApp {
         let chats = chats_path.as_ref().map(|path| dir_size(path)).unwrap_or(0);
         let settings = file_size(settings_path()) + file_size(Some(mcp::default_config_path()));
         let captures = dir_size(&captures_directory());
+        // Laya (the local decision model, Python runtime and weights) and the memory embedding
+        // model are each their own well-known folder, so they get named instead of folded into
+        // "other app data" where they would otherwise be most of it.
+        let laya = dir_size(&crate::laya::root());
+        let embedding_model = dir_size(&crate::memory::embed::model_dir());
         let app_total = root.as_ref().map(|root| dir_size(root)).unwrap_or(0);
         let other = app_total
             .saturating_sub(chats)
             .saturating_sub(file_size(settings_path()))
-            .saturating_sub(file_size(Some(mcp::default_config_path())));
+            .saturating_sub(file_size(Some(mcp::default_config_path())))
+            .saturating_sub(captures)
+            .saturating_sub(laya)
+            .saturating_sub(embedding_model);
         self.storage_breakdown = vec![
             ("Chats".into(), chats, HOVER_GREEN),
+            ("Laya (local model)".into(), laya, MEMORY_SEGMENT),
+            ("Memory embedding model".into(), embedding_model, Color32::from_rgb(90, 140, 120)),
             ("Settings & MCP".into(), settings, MINT_DEEP),
             (
                 "Screen captures".into(),
@@ -4529,7 +4551,7 @@ impl RheaApp {
             }
         }
         if fast_toggled {
-            self.notice = if self.fast_mode { "Fast mode on: about 1.5x speed, uses more of your plan.".into() } else { "Fast mode off.".into() };
+            self.notice = if self.fast_mode { "Fast mode on: priority processing when the account supports it; may use more of your usage.".into() } else { "Fast mode off.".into() };
             if let Err(error) = save_fast_mode(self.fast_mode) {
                 self.notice = error;
             }
@@ -6009,8 +6031,8 @@ fn fast_bolt(ui: &mut egui::Ui, on: bool) -> egui::Response {
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, if on { "Fast mode, on" } else { "Fast mode, off" }));
     response.on_hover_ui(|ui| {
         ui.label(egui::RichText::new(if on { "Fast mode · on" } else { "Fast mode" }).strong().color(INK));
-        ui.label(egui::RichText::new("1.5x speed").color(INK));
-        ui.label(egui::RichText::new("More usage").size(11.0).color(MUTED));
+        ui.label(egui::RichText::new("Priority processing, when the account supports it").color(INK));
+        ui.label(egui::RichText::new("May use more of your usage").size(11.0).color(MUTED));
     })
 }
 
